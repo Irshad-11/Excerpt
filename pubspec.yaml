@@ -35,6 +35,11 @@ dependencies:
   # Use with the CupertinoIcons class for iOS style icons.
   cupertino_icons: ^1.0.8
 
+  # SQLite database — persistent, scalable storage for folders/messages.
+  sqflite: ^2.4.1
+  # Cross-platform path joining, used to build the database file path.
+  path: ^1.9.0
+
 dev_dependencies:
   flutter_test:
     sdk: flutter

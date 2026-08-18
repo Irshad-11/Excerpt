@@ -1,5 +1,8 @@
 package com.example.excerpt
 
+
+import android.widget.ImageView
+
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
@@ -12,7 +15,6 @@ import android.graphics.PixelFormat
 import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
 import android.graphics.drawable.RippleDrawable
-import android.graphics.drawable.StateListDrawable
 import android.inputmethodservice.InputMethodService
 import android.os.Build
 import android.os.Handler
@@ -35,9 +37,6 @@ import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
 import androidx.core.app.NotificationCompat
-import org.json.JSONArray
-import org.json.JSONObject
-import java.io.File
 import java.text.SimpleDateFormat
 import java.util.Locale
 
@@ -59,7 +58,7 @@ class ExcerptInputMethodService : InputMethodService() {
         private const val AUTO_DISMISS_DELAY = 8000L
 
         // How long the success state stays visible before closing.
-        private const val SUCCESS_HOLD_DELAY = 900L
+        private const val SUCCESS_HOLD_DELAY = 1800L
 
         private const val ANIM_SHORT = 160L
         private const val ANIM_MED = 220L
@@ -72,6 +71,7 @@ class ExcerptInputMethodService : InputMethodService() {
     private lateinit var clipboardManager: ClipboardManager
     private lateinit var handler: Handler
     private lateinit var prefs: android.content.SharedPreferences
+    private lateinit var databaseHelper: ExcerptDatabaseHelper
 
     private var windowManager: WindowManager? = null
     private var overlayRoot: View? = null
@@ -113,6 +113,7 @@ class ExcerptInputMethodService : InputMethodService() {
 
         handler = Handler(Looper.getMainLooper())
         prefs = getSharedPreferences(Prefs.NAME, Context.MODE_PRIVATE)
+        databaseHelper = ExcerptDatabaseHelper(this)
         clipboardManager = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
         windowManager = getSystemService(Context.WINDOW_SERVICE) as WindowManager
 
@@ -154,6 +155,14 @@ class ExcerptInputMethodService : InputMethodService() {
 
         stopClipboardMonitoring()
         removeKeyboardNotification()
+
+        if (::databaseHelper.isInitialized) {
+            try {
+                databaseHelper.close()
+            } catch (e: Exception) {
+                Log.e(TAG, "Could not close Excerpt database", e)
+            }
+        }
 
         if (::clipboardManager.isInitialized) {
             try {
@@ -374,28 +383,49 @@ class ExcerptInputMethodService : InputMethodService() {
     }
 
     // ============================================================
-    // Data layer — reads/writes the SAME files Flutter's
-    // FolderStore uses (filesDir/folders/<name>/messages.json),
-    // so the overlay can save without ever opening the app.
+    // Data layer — uses the SAME SQLite database Flutter uses:
+    // filesDir/excerpt.db
+    //
+    // The schema is mirrored by ExcerptDatabaseHelper. This means
+    // folders/messages created here are immediately visible to the
+    // Flutter app, and vice versa.
     // ============================================================
-
-    private fun foldersRootDir(): File {
-        val dir = File(filesDir, "folders")
-        if (!dir.exists()) dir.mkdirs()
-        return dir
-    }
 
     private fun sanitizeFolderName(name: String): String {
         return name.trim().replace(Regex("""[\\/:*?"<>|]"""), "_")
     }
 
     private fun listFolderNames(): List<String> {
-        val root = foldersRootDir()
-        val names = root.listFiles()
-            ?.filter { it.isDirectory }
-            ?.map { it.name }
-            ?.sorted()
-            ?.toMutableList() ?: mutableListOf()
+        val db = try {
+            databaseHelper.readableDatabase
+        } catch (e: Exception) {
+            Log.e(TAG, "Could not open Excerpt database", e)
+            return emptyList()
+        }
+
+        val names = mutableListOf<String>()
+
+        try {
+            db.query(
+                "folders",
+                arrayOf("name"),
+                null,
+                null,
+                null,
+                null,
+                "name COLLATE NOCASE ASC"
+            ).use { cursor ->
+                val nameIndex = cursor.getColumnIndexOrThrow("name")
+                while (cursor.moveToNext()) {
+                    names.add(cursor.getString(nameIndex))
+                }
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Could not list folders from SQLite", e)
+        } finally {
+            // Do not close the database here. SQLiteOpenHelper manages the
+            // connection lifecycle for this service instance.
+        }
 
         val lastUsed = prefs.getString(Prefs.KEY_LAST_FOLDER, null)
 
@@ -406,14 +436,60 @@ class ExcerptInputMethodService : InputMethodService() {
         return names
     }
 
-    private fun ensureFolder(name: String): File {
-        val dir = File(foldersRootDir(), name)
-        if (!dir.exists()) dir.mkdirs()
-        return dir
-    }
+    private fun ensureFolder(name: String): Long {
+        val db = databaseHelper.writableDatabase
 
-    private fun messagesFile(folder: String): File {
-        return File(ensureFolder(folder), "messages.json")
+        // Same semantics as Flutter FolderStore._folderId():
+        // return an existing folder ID, otherwise create it.
+        db.query(
+            "folders",
+            arrayOf("id"),
+            "name = ?",
+            arrayOf(name),
+            null,
+            null,
+            null,
+            "1"
+        ).use { cursor ->
+            if (cursor.moveToFirst()) {
+                return cursor.getLong(cursor.getColumnIndexOrThrow("id"))
+            }
+        }
+
+        val values = android.content.ContentValues().apply {
+            put("name", name)
+            put("created_at", isoTimestamp())
+        }
+
+        val insertedId = db.insertWithOnConflict(
+            "folders",
+            null,
+            values,
+            android.database.sqlite.SQLiteDatabase.CONFLICT_IGNORE
+        )
+
+        if (insertedId != -1L) {
+            return insertedId
+        }
+
+        // Another writer (Flutter or another service instance) may have
+        // created the same folder between our SELECT and INSERT.
+        db.query(
+            "folders",
+            arrayOf("id"),
+            "name = ?",
+            arrayOf(name),
+            null,
+            null,
+            null,
+            "1"
+        ).use { cursor ->
+            if (cursor.moveToFirst()) {
+                return cursor.getLong(cursor.getColumnIndexOrThrow("id"))
+            }
+        }
+
+        throw IllegalStateException("Could not create or find folder: $name")
     }
 
     private fun isoTimestamp(): String {
@@ -422,27 +498,25 @@ class ExcerptInputMethodService : InputMethodService() {
     }
 
     private fun appendMessage(folder: String, text: String, type: String) {
-        val file = messagesFile(folder)
+        val db = databaseHelper.writableDatabase
+        val folderId = ensureFolder(folder)
 
-        val array = if (file.exists() && file.length() > 0) {
-            try {
-                JSONArray(file.readText())
-            } catch (e: Exception) {
-                JSONArray()
-            }
-        } else {
-            JSONArray()
+        val values = android.content.ContentValues().apply {
+            put("id", java.util.UUID.randomUUID().toString())
+            put("folder_id", folderId)
+            put("text", text)
+            put("type", type)
+            put("timestamp", isoTimestamp())
+            put("important", 0)
+            put("edited", 0)
+            putNull("extra")
         }
 
-        val obj = JSONObject()
-        obj.put("id", (System.currentTimeMillis() * 1000).toString())
-        obj.put("text", text)
-        obj.put("type", type)
-        obj.put("timestamp", isoTimestamp())
+        val inserted = db.insert("messages", null, values)
 
-        array.put(obj)
-
-        file.writeText(array.toString())
+        if (inserted == -1L) {
+            throw IllegalStateException("Could not save message to SQLite")
+        }
 
         prefs.edit().putString(Prefs.KEY_LAST_FOLDER, folder).apply()
     }
@@ -800,51 +874,58 @@ class ExcerptInputMethodService : InputMethodService() {
     // ---- Success state ----
 
     private fun showSuccessContent(folder: String) {
-        val container = LinearLayout(this)
-        container.orientation = LinearLayout.VERTICAL
-        container.gravity = Gravity.CENTER_HORIZONTAL
-        container.setPadding(dp(16), dp(18), dp(16), dp(18))
+    val container = LinearLayout(this)
+    container.orientation = LinearLayout.HORIZONTAL
+    container.gravity = Gravity.CENTER
+    container.setPadding(dp(16), dp(14), dp(16), dp(14))
 
-        val check = TextView(this)
-        check.text = "\u2713"
-        check.setTextColor(Color.rgb(60, 190, 165))
-        check.textSize = 30f
-        check.gravity = Gravity.CENTER
-        check.scaleX = 0f
-        check.scaleY = 0f
+    // Success icon
+    val check = ImageView(this)
+    check.setImageResource(com.example.excerpt.R.drawable.ic_check)
+    check.scaleType = ImageView.ScaleType.CENTER
+    check.scaleX = 0f
+    check.scaleY = 0f
 
-        container.addView(
-            check,
-            LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.WRAP_CONTENT,
-                ViewGroup.LayoutParams.WRAP_CONTENT
-            )
+    container.addView(
+        check,
+        LinearLayout.LayoutParams(
+            dp(18),
+            dp(18)
+        ).apply {
+            marginEnd = dp(6)
+        }
+    )
+
+    // Success text
+    val label = TextView(this)
+    label.text = "Saved to \"$folder\""
+    label.setTextColor(Color.WHITE)
+    label.textSize = 13f
+    label.gravity = Gravity.CENTER_VERTICAL
+
+    container.addView(
+        label,
+        LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.WRAP_CONTENT,
+            ViewGroup.LayoutParams.WRAP_CONTENT
         )
+    )
 
-        container.addView(spacer(dp(6)))
+    swapContent(container)
 
-        val label = TextView(this)
-        label.text = "Saved to \u201C$folder\u201D"
-        label.setTextColor(Color.WHITE)
-        label.textSize = 13f
-        label.gravity = Gravity.CENTER
+    // Small check animation
+    check.animate()
+        .scaleX(1f)
+        .scaleY(1f)
+        .setStartDelay(ANIM_SHORT)
+        .setDuration(220L)
+        .setInterpolator(OvershootInterpolator())
+        .start()
 
-        container.addView(label)
-
-        swapContent(container)
-
-        check.animate()
-            .scaleX(1f)
-            .scaleY(1f)
-            .setStartDelay(ANIM_SHORT)
-            .setDuration(280L)
-            .setInterpolator(OvershootInterpolator())
-            .start()
-
-        handler.postDelayed({
-            animateDismiss()
-        }, SUCCESS_HOLD_DELAY + ANIM_SHORT)
-    }
+    handler.postDelayed({
+        animateDismiss()
+    }, SUCCESS_HOLD_DELAY + ANIM_SHORT)
+}
 
     // ---- Focus handling for the inline "new folder" input ----
 
