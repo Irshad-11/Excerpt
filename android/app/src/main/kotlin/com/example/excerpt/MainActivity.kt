@@ -5,301 +5,211 @@ import android.content.Intent
 import android.net.Uri
 import android.os.Build
 import android.provider.Settings
-import android.text.TextUtils
 import android.view.inputmethod.InputMethodManager
 import androidx.annotation.NonNull
+import androidx.core.app.ActivityCompat
+import androidx.core.app.NotificationManagerCompat
 import io.flutter.embedding.android.FlutterActivity
 import io.flutter.embedding.engine.FlutterEngine
 import io.flutter.plugin.common.MethodChannel
 
 class MainActivity : FlutterActivity() {
 
-    private val CHANNEL =
-        "com.excerpt/native"
+    private val CHANNEL = "com.excerpt/native"
 
-    private var methodChannel:
-        MethodChannel? = null
+    private var methodChannel: MethodChannel? = null
 
-    override fun configureFlutterEngine(
-        @NonNull flutterEngine: FlutterEngine
-    ) {
+    private val NOTIFICATION_PERMISSION_REQUEST_CODE = 5001
 
-        super.configureFlutterEngine(
-            flutterEngine
+    override fun configureFlutterEngine(@NonNull flutterEngine: FlutterEngine) {
+        super.configureFlutterEngine(flutterEngine)
+
+        methodChannel = MethodChannel(
+            flutterEngine.dartExecutor.binaryMessenger,
+            CHANNEL
         )
 
-        methodChannel =
-            MethodChannel(
-                flutterEngine.dartExecutor.binaryMessenger,
-                CHANNEL
-            )
+        methodChannel?.setMethodCallHandler { call, result ->
 
-        methodChannel?.setMethodCallHandler {
-                call,
-                result ->
-
-            val prefs =
-                getSharedPreferences(
-                    Prefs.NAME,
-                    Context.MODE_PRIVATE
-                )
+            val prefs = getSharedPreferences(Prefs.NAME, Context.MODE_PRIVATE)
 
             when (call.method) {
 
-                "getAppFilesDir" -> {
+                // =================================================
+                // App files
+                // =================================================
 
-                    result.success(
-                        filesDir.absolutePath
-                    )
+                "getAppFilesDir" -> {
+                    result.success(filesDir.absolutePath)
                 }
 
-                "isClipboardEnabled" -> {
+                // =================================================
+                // Clipboard monitoring
+                // =================================================
 
-                    result.success(
-                        prefs.getBoolean(
-                            Prefs.KEY_ENABLED,
-                            false
-                        )
-                    )
+                "isClipboardEnabled" -> {
+                    result.success(prefs.getBoolean(Prefs.KEY_ENABLED, false))
                 }
 
                 "setClipboardEnabled" -> {
+                    val value = call.arguments as Boolean
 
-                    val value =
-                        call.arguments as Boolean
+                    prefs.edit().putBoolean(Prefs.KEY_ENABLED, value).apply()
 
-                    prefs.edit()
-                        .putBoolean(
-                            Prefs.KEY_ENABLED,
-                            value
-                        )
-                        .apply()
-
-                    result.success(
-                        null
-                    )
+                    result.success(null)
                 }
 
+                // =================================================
+                // Overlay permission
+                // =================================================
+
                 "canDrawOverlays" -> {
+                    val can = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                        Settings.canDrawOverlays(this)
+                    } else {
+                        true
+                    }
 
-                    val can =
-                        if (
-                            Build.VERSION.SDK_INT >=
-                            Build.VERSION_CODES.M
-                        ) {
-
-                            Settings.canDrawOverlays(
-                                this
-                            )
-
-                        } else {
-
-                            true
-                        }
-
-                    result.success(
-                        can
-                    )
+                    result.success(can)
                 }
 
                 "requestOverlayPermission" -> {
-
-                    if (
-                        Build.VERSION.SDK_INT >=
-                        Build.VERSION_CODES.M
-                    ) {
-
-                        val intent =
-                            Intent(
-                                Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
-                                Uri.parse(
-                                    "package:$packageName"
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                        try {
+                            startActivity(
+                                Intent(
+                                    Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
+                                    Uri.parse("package:$packageName")
                                 )
                             )
+                        } catch (e: Exception) {
+                            startActivity(Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION))
+                        }
+                    }
 
-                        startActivity(
-                            intent
+                    result.success(null)
+                }
+
+                // =================================================
+                // Notification permission (Android 13+ / 16)
+                // =================================================
+
+                "hasNotificationPermission" -> {
+                    val granted = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                        checkSelfPermission(android.Manifest.permission.POST_NOTIFICATIONS) ==
+                            android.content.pm.PackageManager.PERMISSION_GRANTED
+                    } else {
+                        NotificationManagerCompat.from(this).areNotificationsEnabled()
+                    }
+
+                    result.success(granted)
+                }
+
+                "requestNotificationPermission" -> {
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                        ActivityCompat.requestPermissions(
+                            this,
+                            arrayOf(android.Manifest.permission.POST_NOTIFICATIONS),
+                            NOTIFICATION_PERMISSION_REQUEST_CODE
                         )
                     }
 
-                    result.success(
-                        null
-                    )
+                    result.success(null)
                 }
 
-                "isExcerptDefaultIme" -> {
+                // =================================================
+                // Input Method
+                // =================================================
 
-                    result.success(
-                        isExcerptDefaultIme()
-                    )
+                "isExcerptDefaultIme" -> {
+                    result.success(isExcerptDefaultIme())
                 }
 
                 "openImeSettings" -> {
-
                     openImeSettings()
-
-                    result.success(
-                        null
-                    )
+                    result.success(null)
                 }
 
                 "openInputMethodPicker" -> {
+                    try {
+                        val imm = getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager
+                        imm.showInputMethodPicker()
+                    } catch (e: Exception) {
+                        result.error("IME_PICKER_ERROR", e.message, null)
+                        return@setMethodCallHandler
+                    }
 
-                    val imm =
-                        getSystemService(
-                            Context.INPUT_METHOD_SERVICE
-                        ) as InputMethodManager
-
-                    imm.showInputMethodPicker()
-
-                    result.success(
-                        null
-                    )
+                    result.success(null)
                 }
 
-                "getPendingClipText" -> {
+                // =================================================
+                // Pending clipboard text
+                // =================================================
 
-                    result.success(
-                        prefs.getString(
-                            Prefs.KEY_PENDING_TEXT,
-                            null
-                        )
-                    )
+                "getPendingClipText" -> {
+                    result.success(prefs.getString(Prefs.KEY_PENDING_TEXT, null))
                 }
 
                 "clearPendingClipText" -> {
-
-                    prefs.edit()
-                        .remove(
-                            Prefs.KEY_PENDING_TEXT
-                        )
-                        .apply()
-
-                    result.success(
-                        null
-                    )
+                    prefs.edit().remove(Prefs.KEY_PENDING_TEXT).apply()
+                    result.success(null)
                 }
 
                 else -> {
-
                     result.notImplemented()
                 }
             }
         }
 
-        handleIntent(
-            intent
-        )
+        handleIntent(intent)
     }
 
-    override fun onNewIntent(
-        intent: Intent
-    ) {
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
 
-        super.onNewIntent(
-            intent
-        )
-
-        setIntent(
-            intent
-        )
-
-        handleIntent(
-            intent
-        )
+        setIntent(intent)
+        handleIntent(intent)
     }
 
-    private fun handleIntent(
-        intent: Intent?
-    ) {
+    private fun handleIntent(intent: Intent?) {
+        if (intent?.action == Prefs.ACTION_SAVE_CLIP) {
+            val text = intent.getStringExtra(Prefs.KEY_PENDING_TEXT)
 
-        if (
-            intent?.action ==
-            Prefs.ACTION_SAVE_CLIP
-        ) {
+            if (!text.isNullOrEmpty()) {
+                val prefs = getSharedPreferences(Prefs.NAME, Context.MODE_PRIVATE)
 
-            val text =
-                intent.getStringExtra(
-                    Prefs.KEY_PENDING_TEXT
-                )
+                prefs.edit().putString(Prefs.KEY_PENDING_TEXT, text).apply()
 
-            if (
-                !text.isNullOrEmpty()
-            ) {
-
-                val prefs =
-                    getSharedPreferences(
-                        Prefs.NAME,
-                        Context.MODE_PRIVATE
-                    )
-
-                prefs.edit()
-                    .putString(
-                        Prefs.KEY_PENDING_TEXT,
-                        text
-                    )
-                    .apply()
-
-                methodChannel?.invokeMethod(
-                    "pendingClipText",
-                    text
-                )
+                methodChannel?.invokeMethod("pendingClipText", text)
             }
         }
     }
 
-    private fun isExcerptDefaultIme():
-        Boolean {
+    private fun isExcerptDefaultIme(): Boolean {
+        return try {
+            val imm = getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager
+            val enabled = imm.enabledInputMethodList
+            val ourPackage = packageName
 
-        val imm =
-            getSystemService(
-                Context.INPUT_METHOD_SERVICE
-            ) as InputMethodManager
+            val isEnabled = enabled.any { it.packageName == ourPackage }
+            if (!isEnabled) return false
 
-        val enabled =
-            imm.enabledInputMethodList
-
-        val ourPackage =
-            packageName
-
-        val isEnabled =
-            enabled.any {
-                it.packageName ==
-                    ourPackage
-            }
-
-        if (!isEnabled) {
-            return false
-        }
-
-        val defaultIme =
-            Settings.Secure.getString(
+            val defaultIme = Settings.Secure.getString(
                 contentResolver,
                 Settings.Secure.DEFAULT_INPUT_METHOD
             )
 
-        return defaultIme?.startsWith(
-            ourPackage
-        ) == true
+            defaultIme?.startsWith(ourPackage) == true
+        } catch (e: Exception) {
+            false
+        }
     }
 
     private fun openImeSettings() {
-
         try {
-
-            startActivity(
-                Intent(
-                    Settings.ACTION_INPUT_METHOD_SETTINGS
-                )
-            )
-
+            startActivity(Intent(Settings.ACTION_INPUT_METHOD_SETTINGS))
         } catch (_: Exception) {
-
-            startActivity(
-                Intent(
-                    Settings.ACTION_SETTINGS
-                )
-            )
+            startActivity(Intent(Settings.ACTION_SETTINGS))
         }
     }
 }
