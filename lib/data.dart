@@ -11,18 +11,8 @@ import 'package:sqflite/sqflite.dart';
 // ================================================================
 //
 // Talks to the platform (Kotlin / Swift) side for permissions, the
-// app's private files directory, and — new in this version — asking
-// the OS to share a file (export) or pick one (import).
-//
-// NOTE: `shareFile` and `pickImportFile` are new channel methods.
-// The native side needs a handler for them, following the same
-// pattern as the existing `getAppFilesDir` / `canDrawOverlays` etc.
-//   - shareFile(String path)   -> hand the file to the OS share sheet
-//                                  (Intent.ACTION_SEND / UIActivityViewController)
-//   - pickImportFile() -> String? -> open a document picker filtered
-//                                  to `.json`, copy the picked file into
-//                                  the app sandbox, and return that path
-//                                  (or null if the user cancelled)
+// app's private files directory, and asking the OS to share a file
+// (export) or pick one (import).
 // ================================================================
 
 class NativeBridge {
@@ -130,31 +120,27 @@ class OnboardingStore {
 //
 // `folders` and `messages` hold the real data. `app_meta` is a small
 // free-form key/value table for anything the app needs to remember
-// about itself later (e.g. last export time) without another schema
-// change.
+// about itself later without another schema change.
 //
-// `messages.extra` is a reserved JSON text column, unused today, kept
-// specifically so a future feature (image attachment path, OCR'd
-// text, etc.) can be added by just writing to that column — no schema
-// migration required for that day-one case. When a real, queryable
-// field is needed later, add a proper migration below instead of
-// overloading `extra` forever.
+// v2 adds:
+//   folders.archived   — WhatsApp-style archive flag
+//   messages.image_path — path to an attached image (nullable; the
+//                          image-attachment feature can now be wired
+//                          up in the composer without another
+//                          migration)
 //
 // HOW TO CHANGE THE SCHEMA LATER WITHOUT BREAKING EXISTING DATA:
 //   1. Bump `schemaVersion` by 1.
 //   2. Add a new `if (oldVersion < N) { ... }` block inside
-//      `onUpgrade` that only *adds* columns/tables/indexes (SQLite
-//      can't drop/alter columns easily — prefer additive changes).
-//   3. Never touch the old `_createV1` statements — they only run for
-//      brand-new installs, which already start on the latest
-//      `schemaVersion` once you also update it in `onCreate`.
+//      `onUpgrade` that only *adds* columns/tables/indexes.
+//   3. Never touch the old `_createV1` statements.
 // ================================================================
 
 class AppDatabase {
   AppDatabase._();
   static final AppDatabase instance = AppDatabase._();
 
-  static const int schemaVersion = 1;
+  static const int schemaVersion = 2;
 
   Database? _db;
   Future<Database>? _opening;
@@ -182,12 +168,12 @@ class AppDatabase {
       },
       onCreate: (db, version) async {
         await _createV1(db);
+        await _upgradeToV2(db);
       },
       onUpgrade: (db, oldVersion, newVersion) async {
-        // Example for the next migration, kept as a template:
-        // if (oldVersion < 2) {
-        //   await db.execute('ALTER TABLE messages ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0');
-        // }
+        if (oldVersion < 2) {
+          await _upgradeToV2(db);
+        }
       },
     );
   }
@@ -228,16 +214,68 @@ class AppDatabase {
       )
     ''');
   }
+
+  Future<void> _upgradeToV2(Database db) async {
+    final folderCols = await db.rawQuery('PRAGMA table_info(folders)');
+    final hasArchived =
+        folderCols.any((c) => c['name'] == 'archived');
+    if (!hasArchived) {
+      await db.execute(
+          'ALTER TABLE folders ADD COLUMN archived INTEGER NOT NULL DEFAULT 0');
+    }
+
+    final messageCols = await db.rawQuery('PRAGMA table_info(messages)');
+    final hasImagePath =
+        messageCols.any((c) => c['name'] == 'image_path');
+    if (!hasImagePath) {
+      await db.execute('ALTER TABLE messages ADD COLUMN image_path TEXT');
+    }
+  }
+}
+
+// ================================================================
+// Folder summary — everything the home screen needs to render one
+// chat tile without extra round trips.
+// ================================================================
+
+class FolderSummary {
+  final String name;
+  final String createdAt;
+  final bool archived;
+  final int totalMessages;
+  final int textCount;
+  final int imageCount;
+  final String? lastUpdated;
+  final String? lastMessagePreview;
+
+  const FolderSummary({
+    required this.name,
+    required this.createdAt,
+    required this.archived,
+    required this.totalMessages,
+    required this.textCount,
+    required this.imageCount,
+    this.lastUpdated,
+    this.lastMessagePreview,
+  });
+
+  factory FolderSummary.empty(String name) => FolderSummary(
+        name: name,
+        createdAt: DateTime.now().toIso8601String(),
+        archived: false,
+        totalMessages: 0,
+        textCount: 0,
+        imageCount: 0,
+      );
 }
 
 // ================================================================
 // Folder / message storage (SQLite-backed)
 // ================================================================
 //
-// Public API is intentionally identical to the old JSON-file version
-// so the rest of the app didn't need to change: every message is
-// still a plain `Map<String, dynamic>` with `id`, `text`, `type`,
-// `timestamp`, `important`, `edited`.
+// Public API stays Map<String, dynamic>-based for messages so the
+// existing UI code (FolderScreen, search, etc.) doesn't need to
+// change shape — only new keys/methods were added.
 // ================================================================
 
 class FolderStore {
@@ -256,7 +294,11 @@ class FolderStore {
 
     final insertedId = await db.insert(
       'folders',
-      {'name': name, 'created_at': DateTime.now().toIso8601String()},
+      {
+        'name': name,
+        'created_at': DateTime.now().toIso8601String(),
+        'archived': 0,
+      },
       conflictAlgorithm: ConflictAlgorithm.ignore,
     );
 
@@ -268,15 +310,185 @@ class FolderStore {
     return again.first['id'] as int;
   }
 
-  static Future<List<String>> listFolders() async {
+  // ---- Folder listing ----
+
+  static Future<List<String>> listFolders({bool archived = false}) async {
     final db = await _db;
-    final rows = await db.query('folders', orderBy: 'name COLLATE NOCASE ASC');
+    final rows = await db.query(
+      'folders',
+      where: 'archived = ?',
+      whereArgs: [archived ? 1 : 0],
+      orderBy: 'name COLLATE NOCASE ASC',
+    );
     return rows.map((r) => r['name'] as String).toList();
   }
 
   static Future<void> createFolder(String name) async {
     await _folderId(name, create: true);
   }
+
+  // ---- Folder CRUD: rename / delete ----
+
+  /// Throws [StateError] if [newName] is already taken.
+  static Future<void> renameFolder(String oldName, String newName) async {
+    final trimmed = newName.trim();
+    if (trimmed.isEmpty || trimmed == oldName) return;
+
+    final db = await _db;
+    final clash =
+        await db.query('folders', where: 'name = ?', whereArgs: [trimmed]);
+    if (clash.isNotEmpty) {
+      throw StateError('A folder named "$trimmed" already exists.');
+    }
+
+    await db.update(
+      'folders',
+      {'name': trimmed},
+      where: 'name = ?',
+      whereArgs: [oldName],
+    );
+  }
+
+  /// Deletes the folder and (via ON DELETE CASCADE) every message in it.
+  static Future<void> deleteFolder(String name) async {
+    final db = await _db;
+    await db.delete('folders', where: 'name = ?', whereArgs: [name]);
+  }
+
+  // ---- Archive ----
+
+  static Future<void> setArchived(String name, bool archived) async {
+    final db = await _db;
+    await db.update(
+      'folders',
+      {'archived': archived ? 1 : 0},
+      where: 'name = ?',
+      whereArgs: [name],
+    );
+  }
+
+  static Future<void> archiveFolder(String name) => setArchived(name, true);
+  static Future<void> unarchiveFolder(String name) =>
+      setArchived(name, false);
+
+  // ---- Merge (move all messages of [sourceFolder] into
+  //      [targetFolder], then delete the now-empty source folder) ----
+
+  static Future<void> mergeFolderInto(
+    String sourceFolder,
+    String targetFolder,
+  ) async {
+    if (sourceFolder == targetFolder) return;
+
+    final db = await _db;
+    final sourceId = await _folderId(sourceFolder, create: false);
+    final targetId = await _folderId(targetFolder, create: true);
+
+    await db.transaction((txn) async {
+      final rows = await txn.query(
+        'messages',
+        where: 'folder_id = ?',
+        whereArgs: [sourceId],
+        orderBy: 'seq ASC',
+      );
+
+      for (final row in rows) {
+        await txn.insert('messages', {
+          'id': '${DateTime.now().microsecondsSinceEpoch}_${row['seq']}',
+          'folder_id': targetId,
+          'text': row['text'],
+          'type': row['type'],
+          'timestamp': row['timestamp'],
+          'important': row['important'],
+          'edited': row['edited'],
+          'image_path': row['image_path'],
+        });
+      }
+
+      await txn.delete('folders', where: 'id = ?', whereArgs: [sourceId]);
+    });
+  }
+
+  // ---- Stats (for home-screen chat tiles) ----
+
+  static Future<FolderSummary> getFolderSummary(String name) async {
+    final db = await _db;
+    final folderRows =
+        await db.query('folders', where: 'name = ?', whereArgs: [name]);
+
+    if (folderRows.isEmpty) return FolderSummary.empty(name);
+
+    final row = folderRows.first;
+    final folderId = row['id'] as int;
+
+    return _summaryForFolderRow(db, row, folderId);
+  }
+
+  static Future<FolderSummary> _summaryForFolderRow(
+    Database db,
+    Map<String, dynamic> folderRow,
+    int folderId,
+  ) async {
+    final countRow = await db.rawQuery('''
+      SELECT
+        COUNT(*) AS total,
+        SUM(CASE WHEN type = 'image' THEN 1 ELSE 0 END) AS images,
+        MAX(timestamp) AS last_ts
+      FROM messages WHERE folder_id = ?
+    ''', [folderId]);
+
+    final total = (countRow.first['total'] as int?) ?? 0;
+    final images = (countRow.first['images'] as int?) ?? 0;
+    final lastTs = countRow.first['last_ts'] as String?;
+
+    String? preview;
+    if (lastTs != null) {
+      final lastRow = await db.query(
+        'messages',
+        where: 'folder_id = ?',
+        whereArgs: [folderId],
+        orderBy: 'seq DESC',
+        limit: 1,
+      );
+      if (lastRow.isNotEmpty) {
+        preview = lastRow.first['text'] as String?;
+      }
+    }
+
+    return FolderSummary(
+      name: folderRow['name'] as String,
+      createdAt: folderRow['created_at'] as String,
+      archived: (folderRow['archived'] as int? ?? 0) == 1,
+      totalMessages: total,
+      textCount: total - images,
+      imageCount: images,
+      lastUpdated: lastTs,
+      lastMessagePreview: preview,
+    );
+  }
+
+  /// Batch version used by the home screen — one query per folder is
+  /// fine at normal folder counts (dozens), and keeps this simple.
+  static Future<List<FolderSummary>> listFolderSummaries({
+    bool archived = false,
+  }) async {
+    final db = await _db;
+    final folderRows = await db.query(
+      'folders',
+      where: 'archived = ?',
+      whereArgs: [archived ? 1 : 0],
+      orderBy: 'name COLLATE NOCASE ASC',
+    );
+
+    final results = <FolderSummary>[];
+    for (final row in folderRows) {
+      final folderId = row['id'] as int;
+      results.add(await _summaryForFolderRow(db, row, folderId));
+    }
+    return results;
+  }
+
+  // ---- Messages ----
 
   static Map<String, dynamic> _rowToMessage(Map<String, dynamic> row) {
     return {
@@ -286,6 +498,7 @@ class FolderStore {
       'timestamp': row['timestamp'] as String,
       'important': (row['important'] as int) == 1,
       'edited': (row['edited'] as int) == 1,
+      'image_path': row['image_path'] as String?,
     };
   }
 
@@ -312,8 +525,9 @@ class FolderStore {
   static Future<void> _appendMessage(
     String folder,
     String text,
-    String type,
-  ) async {
+    String type, {
+    String? imagePath,
+  }) async {
     final db = await _db;
     final folderId = await _folderId(folder);
 
@@ -325,6 +539,7 @@ class FolderStore {
       'timestamp': DateTime.now().toIso8601String(),
       'important': 0,
       'edited': 0,
+      'image_path': imagePath,
     });
   }
 
@@ -336,6 +551,17 @@ class FolderStore {
   /// Text the user typed directly inside the app.
   static Future<void> appendUserMessage(String folder, String text) {
     return _appendMessage(folder, text, 'user');
+  }
+
+  /// An image attachment. [caption] is optional accompanying text.
+  /// [imagePath] should already point to a file copied into the app's
+  /// own storage (don't rely on a picker's cache path surviving).
+  static Future<void> appendImageMessage(
+    String folder,
+    String imagePath, {
+    String caption = '',
+  }) {
+    return _appendMessage(folder, caption, 'image', imagePath: imagePath);
   }
 
   static Future<void> deleteMessages(String folder, Set<String> ids) async {
@@ -413,6 +639,7 @@ class FolderStore {
       'timestamp': DateTime.now().toIso8601String(),
       'important': message['important'] == true ? 1 : 0,
       'edited': 0,
+      'image_path': message['image_path'] as String?,
     });
   }
 }
@@ -489,6 +716,7 @@ class ImportExportService {
       folders.add({
         'name': folderRow['name'],
         'created_at': folderRow['created_at'],
+        'archived': (folderRow['archived'] as int? ?? 0) == 1,
         'messages': messageRows
             .map((m) => {
                   'id': m['id'],
@@ -497,6 +725,7 @@ class ImportExportService {
                   'timestamp': m['timestamp'],
                   'important': (m['important'] as int) == 1,
                   'edited': (m['edited'] as int) == 1,
+                  'image_path': m['image_path'],
                 })
             .toList(),
       });
@@ -633,6 +862,7 @@ class ImportExportService {
             'name': name,
             'created_at': folderEntry['created_at'] as String? ??
                 DateTime.now().toIso8601String(),
+            'archived': folderEntry['archived'] == true ? 1 : 0,
           });
           insertedFolders++;
         } else {
@@ -661,6 +891,7 @@ class ImportExportService {
             'timestamp': m['timestamp'] as String,
             'important': m['important'] == true ? 1 : 0,
             'edited': m['edited'] == true ? 1 : 0,
+            'image_path': m['image_path'] as String?,
           });
           insertedMessages++;
         }
