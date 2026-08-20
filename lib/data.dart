@@ -9,11 +9,6 @@ import 'package:sqflite/sqflite.dart';
 // ================================================================
 // Native bridge
 // ================================================================
-//
-// Talks to the platform (Kotlin / Swift) side for permissions, the
-// app's private files directory, and asking the OS to share a file
-// (export) or pick one (import).
-// ================================================================
 
 class NativeBridge {
   static const _channel = MethodChannel('com.excerpt/native');
@@ -91,6 +86,14 @@ class NativeBridge {
   static Future<String?> pickImportFile() {
     return _channel.invokeMethod<String>('pickImportFile');
   }
+
+  /// Saves the image at [path] into the device's public gallery
+  /// (Pictures/Excerpt on Android, via MediaStore). The native side
+  /// of this call (MainActivity.kt) ships in the next batch — this
+  /// stub lets the UI be wired up now without breaking the build.
+  static Future<void> saveImageToGallery(String path) {
+    return _channel.invokeMethod('saveImageToGallery', path);
+  }
 }
 
 // ================================================================
@@ -118,29 +121,30 @@ class OnboardingStore {
 // SQLite database — schema + migrations
 // ================================================================
 //
-// `folders` and `messages` hold the real data. `app_meta` is a small
-// free-form key/value table for anything the app needs to remember
-// about itself later without another schema change.
+// v3 splits the old single `type` column (which used to mean three
+// different things: 'system'/'user'/'image') into two clear columns:
 //
-// v2 adds:
-//   folders.archived   — WhatsApp-style archive flag
-//   messages.image_path — path to an attached image (nullable; the
-//                          image-attachment feature can now be wired
-//                          up in the composer without another
-//                          migration)
+//   type   — WHAT the message is:   'text' | 'image'
+//   source — WHO sent it:           'user' | 'system'
 //
-// HOW TO CHANGE THE SCHEMA LATER WITHOUT BREAKING EXISTING DATA:
-//   1. Bump `schemaVersion` by 1.
-//   2. Add a new `if (oldVersion < N) { ... }` block inside
-//      `onUpgrade` that only *adds* columns/tables/indexes.
-//   3. Never touch the old `_createV1` statements.
+// Migration backfills existing rows: old type='system' -> source
+// 'system'; everything else defaults to source='user' (matches
+// reality, since every existing image was added by hand in the
+// composer). Old type='system'/'user' both collapse into type='text'.
+//
+// IMPORTANT: android/.../ExcerptDatabaseHelper.kt mirrors this same
+// schema on the native side (same physical SQLite file) — its
+// DATABASE_VERSION and onUpgrade() must be bumped in lockstep with
+// this file, or the two sides silently disagree (this bit us once
+// already: a mismatched version made the native side treat the file
+// as a "downgrade" and quietly fail to read folders).
 // ================================================================
 
 class AppDatabase {
   AppDatabase._();
   static final AppDatabase instance = AppDatabase._();
 
-  static const int schemaVersion = 2;
+  static const int schemaVersion = 3;
 
   Database? _db;
   Future<Database>? _opening;
@@ -169,10 +173,14 @@ class AppDatabase {
       onCreate: (db, version) async {
         await _createV1(db);
         await _upgradeToV2(db);
+        await _upgradeToV3(db);
       },
       onUpgrade: (db, oldVersion, newVersion) async {
         if (oldVersion < 2) {
           await _upgradeToV2(db);
+        }
+        if (oldVersion < 3) {
+          await _upgradeToV3(db);
         }
       },
     );
@@ -216,26 +224,43 @@ class AppDatabase {
   }
 
   Future<void> _upgradeToV2(Database db) async {
-    final folderCols = await db.rawQuery('PRAGMA table_info(folders)');
-    final hasArchived =
-        folderCols.any((c) => c['name'] == 'archived');
-    if (!hasArchived) {
-      await db.execute(
-          'ALTER TABLE folders ADD COLUMN archived INTEGER NOT NULL DEFAULT 0');
-    }
+    await _addColumnIfMissing(
+        db, 'folders', 'archived', 'INTEGER NOT NULL DEFAULT 0');
+    await _addColumnIfMissing(db, 'messages', 'image_path', 'TEXT');
+  }
 
-    final messageCols = await db.rawQuery('PRAGMA table_info(messages)');
-    final hasImagePath =
-        messageCols.any((c) => c['name'] == 'image_path');
-    if (!hasImagePath) {
-      await db.execute('ALTER TABLE messages ADD COLUMN image_path TEXT');
+  Future<void> _upgradeToV3(Database db) async {
+    final added = await _addColumnIfMissing(
+        db, 'messages', 'source', "TEXT NOT NULL DEFAULT 'user'");
+
+    if (added) {
+      // Backfill from the old overloaded `type` column, then
+      // normalise `type` down to just 'text' | 'image'.
+      await db.execute(
+          "UPDATE messages SET source = 'system' WHERE type = 'system'");
+      await db.execute(
+          "UPDATE messages SET type = 'text' WHERE type IN ('system', 'user')");
     }
+  }
+
+  Future<bool> _addColumnIfMissing(
+    Database db,
+    String table,
+    String column,
+    String definition,
+  ) async {
+    final cols = await db.rawQuery('PRAGMA table_info($table)');
+    final exists = cols.any((c) => c['name'] == column);
+    if (!exists) {
+      await db.execute('ALTER TABLE $table ADD COLUMN $column $definition');
+      return true;
+    }
+    return false;
   }
 }
 
 // ================================================================
-// Folder summary — everything the home screen needs to render one
-// chat tile without extra round trips.
+// Folder summary
 // ================================================================
 
 class FolderSummary {
@@ -272,11 +297,6 @@ class FolderSummary {
 // ================================================================
 // Folder / message storage (SQLite-backed)
 // ================================================================
-//
-// Public API stays Map<String, dynamic>-based for messages so the
-// existing UI code (FolderScreen, search, etc.) doesn't need to
-// change shape — only new keys/methods were added.
-// ================================================================
 
 class FolderStore {
   static Future<Database> get _db async => AppDatabase.instance.database;
@@ -304,7 +324,6 @@ class FolderStore {
 
     if (insertedId != 0) return insertedId;
 
-    // Lost a race with another insert of the same name — read it back.
     final again =
         await db.query('folders', where: 'name = ?', whereArgs: [name]);
     return again.first['id'] as int;
@@ -329,7 +348,6 @@ class FolderStore {
 
   // ---- Folder CRUD: rename / delete ----
 
-  /// Throws [StateError] if [newName] is already taken.
   static Future<void> renameFolder(String oldName, String newName) async {
     final trimmed = newName.trim();
     if (trimmed.isEmpty || trimmed == oldName) return;
@@ -349,7 +367,6 @@ class FolderStore {
     );
   }
 
-  /// Deletes the folder and (via ON DELETE CASCADE) every message in it.
   static Future<void> deleteFolder(String name) async {
     final db = await _db;
     await db.delete('folders', where: 'name = ?', whereArgs: [name]);
@@ -371,8 +388,7 @@ class FolderStore {
   static Future<void> unarchiveFolder(String name) =>
       setArchived(name, false);
 
-  // ---- Merge (move all messages of [sourceFolder] into
-  //      [targetFolder], then delete the now-empty source folder) ----
+  // ---- Merge ----
 
   static Future<void> mergeFolderInto(
     String sourceFolder,
@@ -398,6 +414,7 @@ class FolderStore {
           'folder_id': targetId,
           'text': row['text'],
           'type': row['type'],
+          'source': row['source'],
           'timestamp': row['timestamp'],
           'important': row['important'],
           'edited': row['edited'],
@@ -409,7 +426,7 @@ class FolderStore {
     });
   }
 
-  // ---- Stats (for home-screen chat tiles) ----
+  // ---- Stats ----
 
   static Future<FolderSummary> getFolderSummary(String name) async {
     final db = await _db;
@@ -467,8 +484,6 @@ class FolderStore {
     );
   }
 
-  /// Batch version used by the home screen — one query per folder is
-  /// fine at normal folder counts (dozens), and keeps this simple.
   static Future<List<FolderSummary>> listFolderSummaries({
     bool archived = false,
   }) async {
@@ -495,6 +510,7 @@ class FolderStore {
       'id': row['id'] as String,
       'text': row['text'] as String,
       'type': row['type'] as String,
+      'source': (row['source'] as String?) ?? 'user',
       'timestamp': row['timestamp'] as String,
       'important': (row['important'] as int) == 1,
       'edited': (row['edited'] as int) == 1,
@@ -526,6 +542,7 @@ class FolderStore {
     String folder,
     String text,
     String type, {
+    String source = 'user',
     String? imagePath,
   }) async {
     final db = await _db;
@@ -536,6 +553,7 @@ class FolderStore {
       'folder_id': folderId,
       'text': text,
       'type': type,
+      'source': source,
       'timestamp': DateTime.now().toIso8601String(),
       'important': 0,
       'edited': 0,
@@ -545,23 +563,25 @@ class FolderStore {
 
   /// Text captured from another app via the overlay/clipboard.
   static Future<void> appendSystemMessage(String folder, String text) {
-    return _appendMessage(folder, text, 'system');
+    return _appendMessage(folder, text, 'text', source: 'system');
   }
 
   /// Text the user typed directly inside the app.
   static Future<void> appendUserMessage(String folder, String text) {
-    return _appendMessage(folder, text, 'user');
+    return _appendMessage(folder, text, 'text', source: 'user');
   }
 
-  /// An image attachment. [caption] is optional accompanying text.
-  /// [imagePath] should already point to a file copied into the app's
-  /// own storage (don't rely on a picker's cache path surviving).
+  /// An image attachment. [source] defaults to 'user' (composer /
+  /// picker) — the Android share-target writes 'system' directly to
+  /// SQLite for images that arrive via the OS share sheet.
   static Future<void> appendImageMessage(
     String folder,
     String imagePath, {
     String caption = '',
+    String source = 'user',
   }) {
-    return _appendMessage(folder, caption, 'image', imagePath: imagePath);
+    return _appendMessage(folder, caption, 'image',
+        source: source, imagePath: imagePath);
   }
 
   static Future<void> deleteMessages(String folder, Set<String> ids) async {
@@ -622,8 +642,6 @@ class FolderStore {
     }
   }
 
-  /// Copies a message into another folder as a brand new entry
-  /// (own id + timestamp), leaving the original untouched.
   static Future<void> copyMessageToFolder(
     String targetFolder,
     Map<String, dynamic> message,
@@ -635,7 +653,8 @@ class FolderStore {
       'id': '${DateTime.now().microsecondsSinceEpoch}_${message.hashCode}',
       'folder_id': folderId,
       'text': message['text'] as String,
-      'type': (message['type'] as String?) ?? 'system',
+      'type': (message['type'] as String?) ?? 'text',
+      'source': (message['source'] as String?) ?? 'user',
       'timestamp': DateTime.now().toIso8601String(),
       'important': message['important'] == true ? 1 : 0,
       'edited': 0,
@@ -646,15 +665,6 @@ class FolderStore {
 
 // ================================================================
 // Import / export
-// ================================================================
-//
-// Export produces a portable, human-readable JSON file: every folder
-// and every message, tagged with a `schema_version`. Import always
-// runs `validate()` first (pure, does not touch the database) so the
-// caller can show the user what's about to happen, then `commit()`
-// writes it — matching existing messages by `id` and skipping them,
-// so importing the same file twice (or importing on a device that
-// already has some of the data) is always safe.
 // ================================================================
 
 class ImportValidationException implements Exception {
@@ -692,9 +702,6 @@ class ImportResult {
 }
 
 class ImportExportService {
-  /// Bump only when the *export file* shape changes. Independent from
-  /// [AppDatabase.schemaVersion] — the file format and the on-device
-  /// schema are allowed to evolve separately.
   static const int formatVersion = 1;
 
   static Future<String> exportToJsonString() async {
@@ -722,6 +729,7 @@ class ImportExportService {
                   'id': m['id'],
                   'text': m['text'],
                   'type': m['type'],
+                  'source': m['source'] ?? 'user',
                   'timestamp': m['timestamp'],
                   'important': (m['important'] as int) == 1,
                   'edited': (m['edited'] as int) == 1,
@@ -741,8 +749,6 @@ class ImportExportService {
     return const JsonEncoder.withIndent('  ').convert(payload);
   }
 
-  /// Writes the export to a file inside the app's own storage and
-  /// returns its path, ready to hand to [NativeBridge.shareFile].
   static Future<String> exportToFile() async {
     final json = await exportToJsonString();
 
@@ -760,9 +766,6 @@ class ImportExportService {
     return file.path;
   }
 
-  /// Parses & validates [jsonString] without touching the database.
-  /// Throws [ImportValidationException] with a user-facing message on
-  /// any problem.
   static ImportPreview validate(String jsonString) {
     dynamic decoded;
     try {
@@ -835,10 +838,6 @@ class ImportExportService {
     );
   }
 
-  /// Writes an already-[validate]d payload into the database.
-  /// Existing messages are matched by `id` and left untouched — only
-  /// ids that don't exist yet are inserted, so importing the same
-  /// file twice is always safe.
   static Future<ImportResult> commit(ImportPreview preview) async {
     final db = await AppDatabase.instance.database;
 
@@ -883,11 +882,22 @@ class ImportExportService {
             continue;
           }
 
+          // Older export files (pre-source-column) won't have
+          // `source` — default it sensibly from the legacy `type`.
+          final legacyType = m['type'] as String;
+          final source = m['source'] as String? ??
+              (legacyType == 'system' ? 'system' : 'user');
+          final normalizedType =
+              legacyType == 'system' || legacyType == 'user'
+                  ? 'text'
+                  : legacyType;
+
           await txn.insert('messages', {
             'id': id,
             'folder_id': folderId,
             'text': m['text'] as String,
-            'type': m['type'] as String,
+            'type': normalizedType,
+            'source': source,
             'timestamp': m['timestamp'] as String,
             'important': m['important'] == true ? 1 : 0,
             'edited': m['edited'] == true ? 1 : 0,

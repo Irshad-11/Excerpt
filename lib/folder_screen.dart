@@ -171,15 +171,12 @@ class _FolderScreenState extends State<FolderScreen> {
     if (mounted) setState(() => _sending = false);
   }
 
-  // ---- Send image ----
+  // ---- Send image(s) — multi-select from gallery ----
 
   Future<void> _pickAndSendImage() async {
     final picker = ImagePicker();
-    final picked = await picker.pickImage(
-      source: ImageSource.gallery,
-      imageQuality: 85,
-    );
-    if (picked == null) return;
+    final picked = await picker.pickMultiImage(imageQuality: 85);
+    if (picked.isEmpty) return;
 
     setState(() => _sending = true);
 
@@ -190,14 +187,25 @@ class _FolderScreenState extends State<FolderScreen> {
         await imagesDir.create(recursive: true);
       }
 
-      final ext = p.extension(picked.path).isEmpty ? '.jpg' : p.extension(picked.path);
-      final savedPath = p.join(
-        imagesDir.path,
-        '${DateTime.now().microsecondsSinceEpoch}$ext',
-      );
-      await File(picked.path).copy(savedPath);
+      for (final asset in picked) {
+        final ext =
+            p.extension(asset.path).isEmpty ? '.jpg' : p.extension(asset.path);
+        final savedPath = p.join(
+          imagesDir.path,
+          '${DateTime.now().microsecondsSinceEpoch}_${asset.name}$ext'
+              .replaceAll(RegExp(r'\.{2,}'), '.'),
+        );
+        await File(asset.path).copy(savedPath);
 
-      await FolderStore.appendImageMessage(widget.folderName, savedPath);
+        // This image was picked and sent by the user, inside the
+        // app — always source: 'user'.
+        await FolderStore.appendImageMessage(
+          widget.folderName,
+          savedPath,
+          source: 'user',
+        );
+      }
+
       await _load(scrollToEnd: true);
     } catch (e) {
       if (mounted) {
@@ -272,11 +280,16 @@ class _FolderScreenState extends State<FolderScreen> {
   // ---- Single message actions ----
 
   void _onBubbleTap(Map<String, dynamic> message) {
-    final id = message['id'] as String;
     if (_selectionMode) {
-      _toggleSelected(id);
+      _toggleSelected(message['id'] as String);
       return;
     }
+
+    if (message['type'] == 'image') {
+      _openImageViewer(message);
+      return;
+    }
+
     _showMessageActions(message);
   }
 
@@ -285,10 +298,31 @@ class _FolderScreenState extends State<FolderScreen> {
     _enterSelectionMode(message['id'] as String);
   }
 
+  // ---- Full-screen image viewer ----
+
+  void _openImageViewer(Map<String, dynamic> tappedMessage) async {
+    final images = _messages.where((m) => m['type'] == 'image').toList();
+    final startIndex =
+        images.indexWhere((m) => m['id'] == tappedMessage['id']);
+
+    final changed = await Navigator.push<bool>(
+      context,
+      MaterialPageRoute(
+        builder: (_) => _ImageViewerScreen(
+          folderName: widget.folderName,
+          images: images,
+          initialIndex: startIndex < 0 ? 0 : startIndex,
+        ),
+        fullscreenDialog: true,
+      ),
+    );
+
+    if (changed == true) await _load();
+  }
+
   Future<void> _showMessageActions(Map<String, dynamic> message) async {
     final id = message['id'] as String;
     final text = message['text'] as String? ?? '';
-    final isImage = message['type'] == 'image';
     final important = message['important'] == true;
 
     await showModalBottomSheet(
@@ -311,27 +345,25 @@ class _FolderScreenState extends State<FolderScreen> {
                 ),
               ),
               const SizedBox(height: 8),
-              if (!isImage)
-                ListTile(
-                  leading: const Icon(Icons.copy_rounded),
-                  title: const Text('Copy'),
-                  onTap: () {
-                    Clipboard.setData(ClipboardData(text: text));
-                    Navigator.pop(ctx);
-                    ScaffoldMessenger.of(context).showSnackBar(
-                      const SnackBar(content: Text('Copied to clipboard')),
-                    );
-                  },
-                ),
-              if (!isImage)
-                ListTile(
-                  leading: const Icon(Icons.edit_outlined),
-                  title: const Text('Edit'),
-                  onTap: () {
-                    Navigator.pop(ctx);
-                    _editMessage(id, text);
-                  },
-                ),
+              ListTile(
+                leading: const Icon(Icons.copy_rounded),
+                title: const Text('Copy'),
+                onTap: () {
+                  Clipboard.setData(ClipboardData(text: text));
+                  Navigator.pop(ctx);
+                  ScaffoldMessenger.of(context).showSnackBar(
+                    const SnackBar(content: Text('Copied to clipboard')),
+                  );
+                },
+              ),
+              ListTile(
+                leading: const Icon(Icons.edit_outlined),
+                title: const Text('Edit'),
+                onTap: () {
+                  Navigator.pop(ctx);
+                  _editMessage(id, text);
+                },
+              ),
               ListTile(
                 leading: Icon(
                   important ? Icons.star_rounded : Icons.star_outline_rounded,
@@ -560,10 +592,10 @@ class _FolderScreenState extends State<FolderScreen> {
             leading: CircleAvatar(
               radius: 16,
               child: Icon(
-                message['type'] == 'user'
-                    ? Icons.person_outline
-                    : message['type'] == 'image'
-                        ? Icons.image_outlined
+                message['type'] == 'image'
+                    ? Icons.image_outlined
+                    : message['source'] == 'user'
+                        ? Icons.person_outline
                         : Icons.content_paste,
                 size: 16,
               ),
@@ -614,8 +646,9 @@ class _FolderScreenState extends State<FolderScreen> {
                       itemCount: _messages.length,
                       itemBuilder: (context, index) {
                         final message = _messages[index];
-                        final type = message['type'] as String? ?? 'system';
                         final id = message['id'] as String;
+                        final isUser = message['source'] == 'user';
+                        final isImage = message['type'] == 'image';
 
                         final key = _messageKeys[id] ?? GlobalKey();
                         _messageKeys[id] = key;
@@ -626,8 +659,8 @@ class _FolderScreenState extends State<FolderScreen> {
                             index: index,
                             text: message['text'] as String? ?? '',
                             timestamp: message['timestamp'] as String?,
-                            isUser: type == 'user',
-                            isImage: type == 'image',
+                            isUser: isUser,
+                            isImage: isImage,
                             imagePath: message['image_path'] as String?,
                             important: message['important'] == true,
                             edited: message['edited'] == true,
@@ -708,6 +741,266 @@ class _FolderScreenState extends State<FolderScreen> {
           onPressed: _selectedIds.isEmpty ? null : _deleteSelected,
         ),
       ],
+    );
+  }
+}
+
+// ================================================================
+// Full-screen, swipeable multi-image viewer
+// ================================================================
+//
+// Opened by tapping any image bubble. Shows every image in the
+// folder (not just the tapped one) in a PageView so the user can
+// swipe through them like a gallery. Top bar: back button + a
+// three-dot menu with Download / Share / Delete, each fully wired.
+// ================================================================
+
+class _ImageViewerScreen extends StatefulWidget {
+  final String folderName;
+  final List<Map<String, dynamic>> images;
+  final int initialIndex;
+
+  const _ImageViewerScreen({
+    required this.folderName,
+    required this.images,
+    required this.initialIndex,
+  });
+
+  @override
+  State<_ImageViewerScreen> createState() => _ImageViewerScreenState();
+}
+
+class _ImageViewerScreenState extends State<_ImageViewerScreen> {
+  late List<Map<String, dynamic>> _images = List.of(widget.images);
+  late final PageController _controller =
+      PageController(initialPage: widget.initialIndex);
+  late int _currentIndex = widget.initialIndex;
+  bool _changed = false;
+
+  @override
+  void dispose() {
+    _controller.dispose();
+    super.dispose();
+  }
+
+  String? get _currentPath =>
+      _images.isEmpty ? null : _images[_currentIndex]['image_path'] as String?;
+
+  Future<void> _download() async {
+    final path = _currentPath;
+    if (path == null) return;
+
+    try {
+      await NativeBridge.saveImageToGallery(path);
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('Saved to gallery')),
+        );
+      }
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context)
+            .showSnackBar(SnackBar(content: Text('Could not save: $e')));
+      }
+    }
+  }
+
+  Future<void> _share() async {
+    final path = _currentPath;
+    if (path == null) return;
+
+    try {
+      await NativeBridge.shareFile(path);
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context)
+            .showSnackBar(SnackBar(content: Text('Could not share: $e')));
+      }
+    }
+  }
+
+  Future<void> _delete() async {
+    final id = _images[_currentIndex]['id'] as String?;
+    if (id == null) return;
+
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+        title: const Text('Delete image?'),
+        content: const Text('This can\'t be undone.'),
+        actions: [
+          TextButton(
+              onPressed: () => Navigator.pop(ctx, false),
+              child: const Text('Cancel')),
+          FilledButton(
+            style: FilledButton.styleFrom(backgroundColor: Colors.red.shade400),
+            onPressed: () => Navigator.pop(ctx, true),
+            child: const Text('Delete'),
+          ),
+        ],
+      ),
+    );
+
+    if (confirmed != true) return;
+
+    await FolderStore.deleteMessages(widget.folderName, {id});
+    _changed = true;
+
+    if (!mounted) return;
+
+    setState(() {
+      _images.removeAt(_currentIndex);
+      if (_images.isEmpty) {
+        Navigator.pop(context, true);
+        return;
+      }
+      if (_currentIndex >= _images.length) {
+        _currentIndex = _images.length - 1;
+      }
+    });
+
+    if (_images.isNotEmpty) {
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (_controller.hasClients) {
+          _controller.jumpToPage(_currentIndex);
+        }
+      });
+    }
+  }
+
+  void _showMenu() {
+    showModalBottomSheet(
+      context: context,
+      backgroundColor: const Color(0xFF1C1C20),
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(20)),
+      ),
+      builder: (ctx) {
+        return SafeArea(
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              const SizedBox(height: 8),
+              Container(
+                width: 36,
+                height: 4,
+                decoration: BoxDecoration(
+                  color: Colors.white.withOpacity(0.3),
+                  borderRadius: BorderRadius.circular(4),
+                ),
+              ),
+              const SizedBox(height: 8),
+              ListTile(
+                iconColor: Colors.white,
+                textColor: Colors.white,
+                leading: const Icon(Icons.download_outlined),
+                title: const Text('Download'),
+                onTap: () {
+                  Navigator.pop(ctx);
+                  _download();
+                },
+              ),
+              ListTile(
+                iconColor: Colors.white,
+                textColor: Colors.white,
+                leading: const Icon(Icons.share_outlined),
+                title: const Text('Share'),
+                onTap: () {
+                  Navigator.pop(ctx);
+                  _share();
+                },
+              ),
+              ListTile(
+                iconColor: Colors.red.shade300,
+                textColor: Colors.red.shade300,
+                leading: const Icon(Icons.delete_outline),
+                title: const Text('Delete'),
+                onTap: () {
+                  Navigator.pop(ctx);
+                  _delete();
+                },
+              ),
+              const SizedBox(height: 8),
+            ],
+          ),
+        );
+      },
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return PopScope(
+      canPop: true,
+      onPopInvokedWithResult: (didPop, result) {},
+      child: Scaffold(
+        backgroundColor: Colors.black,
+        appBar: AppBar(
+          backgroundColor: Colors.black,
+          foregroundColor: Colors.white,
+          elevation: 0,
+          leading: IconButton(
+            icon: const Icon(Icons.arrow_back),
+            onPressed: () => Navigator.pop(context, _changed),
+          ),
+          title: _images.isEmpty
+              ? const Text('')
+              : Text('${_currentIndex + 1} / ${_images.length}'),
+          actions: [
+            if (_images.isNotEmpty)
+              IconButton(
+                icon: const Icon(Icons.more_vert_rounded),
+                onPressed: _showMenu,
+              ),
+          ],
+        ),
+        body: _images.isEmpty
+            ? const SizedBox.shrink()
+            : PageView.builder(
+                controller: _controller,
+                itemCount: _images.length,
+                onPageChanged: (index) => setState(() => _currentIndex = index),
+                itemBuilder: (context, index) {
+                  final path = _images[index]['image_path'] as String?;
+                  final caption = _images[index]['text'] as String? ?? '';
+
+                  return Column(
+                    children: [
+                      Expanded(
+                        child: Center(
+                          child: path == null
+                              ? const Icon(Icons.broken_image_outlined,
+                                  color: Colors.white54, size: 48)
+                              : InteractiveViewer(
+                                  minScale: 1,
+                                  maxScale: 4,
+                                  child: Image.file(
+                                    File(path),
+                                    fit: BoxFit.contain,
+                                    errorBuilder: (_, __, ___) => const Icon(
+                                      Icons.broken_image_outlined,
+                                      color: Colors.white54,
+                                      size: 48,
+                                    ),
+                                  ),
+                                ),
+                        ),
+                      ),
+                      if (caption.trim().isNotEmpty)
+                        Padding(
+                          padding: const EdgeInsets.fromLTRB(20, 0, 20, 20),
+                          child: Text(
+                            caption,
+                            textAlign: TextAlign.center,
+                            style: const TextStyle(color: Colors.white70),
+                          ),
+                        ),
+                    ],
+                  );
+                },
+              ),
+      ),
     );
   }
 }
@@ -794,7 +1087,7 @@ class _Composer extends StatelessWidget {
           crossAxisAlignment: CrossAxisAlignment.end,
           children: [
             IconButton(
-              tooltip: 'Attach image',
+              tooltip: 'Attach image(s)',
               onPressed: sending ? null : onAttachImage,
               icon: const Icon(Icons.image_outlined),
             ),
@@ -847,7 +1140,9 @@ class _Composer extends StatelessWidget {
 }
 
 // ================================================================
-// Message bubble — numbered, supports text or image content
+// Message bubble — numbered, supports text or image content.
+// `isUser` now comes from the `source` field (who sent it), fully
+// independent from whether the content is text or an image.
 // ================================================================
 
 class _MessageBubble extends StatelessWidget {
@@ -980,17 +1275,20 @@ class _MessageBubble extends StatelessWidget {
           if (isImage && imagePath != null)
             ClipRRect(
               borderRadius: BorderRadius.circular(12),
-              child: Image.file(
-                File(imagePath!),
-                fit: BoxFit.cover,
-                width: double.infinity,
-                height: 180,
-                errorBuilder: (_, __, ___) => Container(
+              child: Hero(
+                tag: 'image_$imagePath',
+                child: Image.file(
+                  File(imagePath!),
+                  fit: BoxFit.cover,
                   width: double.infinity,
-                  height: 120,
-                  color: Colors.grey.withOpacity(0.15),
-                  alignment: Alignment.center,
-                  child: const Icon(Icons.broken_image_outlined, size: 28),
+                  height: 180,
+                  errorBuilder: (_, __, ___) => Container(
+                    width: double.infinity,
+                    height: 120,
+                    color: Colors.grey.withOpacity(0.15),
+                    alignment: Alignment.center,
+                    child: const Icon(Icons.broken_image_outlined, size: 28),
+                  ),
                 ),
               ),
             ),

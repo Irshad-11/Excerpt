@@ -1,13 +1,12 @@
 <?xml version="1.0" encoding="utf-8"?>
 <!--
   Save this file at: android/app/src/main/res/xml/file_paths.xml
-  (new file — the xml/ folder already exists for ime_method.xml /
-  input_method.xml, just add this alongside them.)
-
-  Tells FileProvider which of the app's own folders it's allowed to
-  share. "exports" matches the folder ImportExportService.exportToFile()
-  writes into (getAppFilesDir()/exports).
+  (replaces the existing one — added the "images" path so the
+  full-screen image viewer's Share button, and any file the share
+  target saves, can be handed to FileProvider.)
 -->
 <paths xmlns:android="http://schemas.android.com/apk/res/android">
     <files-path name="exports" path="exports/" />
+    <files-path name="images" path="images/" />
+    <files-path name="pdf_exports" path="pdf_exports/" />
 </paths>

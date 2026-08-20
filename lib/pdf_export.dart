@@ -1,5 +1,7 @@
 import 'dart:io';
+import 'dart:typed_data';
 
+import 'package:image/image.dart' as img;
 import 'package:path/path.dart' as p;
 import 'package:pdf/pdf.dart';
 import 'package:pdf/widgets.dart' as pw;
@@ -13,24 +15,41 @@ import 'data.dart';
 //
 // Produces a premium-styled, fully Unicode PDF for one folder:
 //   Page 1        — cover page (app name, folder name, meta stats)
-//   Page 2..N     — table of contents (message # + preview, tappable
-//                   jump-links straight to the message — more useful
-//                   in a digital PDF than a static page number, since
-//                   a PDF viewer jumps you there in one tap)
+//   Page 2..N     — table of contents (a genuine MultiPage now — see
+//                   note below — numbered, tap an entry to jump
+//                   straight to that message)
 //   Page N+1..end — every message, numbered, with a running
-//                   "Page X of Y" footer on every content page
+//                   "Page X of Y" footer. Image messages embed the
+//                   actual (resized/compressed) image.
+//
+// IMPORTANT FIX: the table of contents used to be a single fixed
+// `pw.Page` with a `ListView` inside an `Expanded`. A `pw.Page` never
+// paginates — if the folder has enough messages that the TOC content
+// is taller than one A4 page, the pdf package throws a "content too
+// large" overflow exception. It's now a `pw.MultiPage` with a flat
+// widget list (same pattern the message body already used), which
+// automatically spills onto as many pages as needed — no folder size
+// limit anymore.
+//
+// Images are decoded, downscaled (long edge capped) and re-encoded
+// as JPEG *before* being embedded, so a folder with many/large
+// photos doesn't balloon the PDF to an unusable size.
 //
 // Fonts: Noto Sans + Noto Sans Bengali/Devanagari + Noto Naskh Arabic
-// + Noto Nastaliq Urdu are fetched via `printing`'s PdfGoogleFonts
-// helper (cached after first use) and wired up as font *fallbacks*,
-// so a single pw.Text mixing বাংলা + English + اردو + हिन्दी in one
-// message renders correctly without any manual script splitting.
+// + Noto Nastaliq Urdu via `printing`'s PdfGoogleFonts (cached after
+// first use), wired as font *fallbacks* so a single pw.Text mixing
+// বাংলা + English + اردو + हिन्दी renders correctly in one go.
 //
 // Change `kPdfAppName` below to rebrand the cover page.
 // ================================================================
 
 /// Shown on the cover page as the app/brand name. Edit freely.
 const String kPdfAppName = 'Excerpt';
+
+/// Images are downscaled so neither dimension exceeds this (px)
+/// before being embedded, to keep exported PDFs a reasonable size.
+const int _kMaxImageDimension = 1000;
+const int _kJpegQuality = 72;
 
 class PdfExportService {
   static pw.ThemeData? _cachedTheme;
@@ -78,11 +97,16 @@ class PdfExportService {
     final summary = await FolderStore.getFolderSummary(folderName);
     final theme = await _theme();
 
+    // Images must be decoded/compressed up front (async file I/O),
+    // since the synchronous MultiPage `build` callbacks below can't
+    // await anything themselves.
+    final imageCache = await _preloadImages(messages);
+
     final doc = pw.Document(theme: theme);
 
     doc.addPage(_coverPage(folderName, summary));
     doc.addPage(_tocPage(folderName, messages));
-    doc.addPage(_bodyPages(folderName, messages));
+    doc.addPage(_bodyPages(folderName, messages, imageCache));
 
     final bytes = await doc.save();
 
@@ -100,6 +124,51 @@ class PdfExportService {
     await file.writeAsBytes(bytes);
 
     return file.path;
+  }
+
+  // ---- Image loading (resize + compress before embedding) ----
+
+  static Future<Map<String, pw.MemoryImage>> _preloadImages(
+    List<Map<String, dynamic>> messages,
+  ) async {
+    final cache = <String, pw.MemoryImage>{};
+
+    for (final m in messages) {
+      if (m['type'] != 'image') continue;
+
+      final id = m['id'] as String?;
+      final path = m['image_path'] as String?;
+      if (id == null || path == null) continue;
+
+      final loaded = await _loadCompressedImage(path);
+      if (loaded != null) cache[id] = loaded;
+    }
+
+    return cache;
+  }
+
+  static Future<pw.MemoryImage?> _loadCompressedImage(String path) async {
+    try {
+      final file = File(path);
+      if (!await file.exists()) return null;
+
+      final bytes = await file.readAsBytes();
+      final decoded = img.decodeImage(bytes);
+      if (decoded == null) return null;
+
+      img.Image resized = decoded;
+      if (decoded.width > _kMaxImageDimension ||
+          decoded.height > _kMaxImageDimension) {
+        resized = decoded.width >= decoded.height
+            ? img.copyResize(decoded, width: _kMaxImageDimension)
+            : img.copyResize(decoded, height: _kMaxImageDimension);
+      }
+
+      final jpg = img.encodeJpg(resized, quality: _kJpegQuality);
+      return pw.MemoryImage(Uint8List.fromList(jpg));
+    } catch (_) {
+      return null;
+    }
   }
 
   // ---- Cover page ----
@@ -183,9 +252,9 @@ class PdfExportService {
                 pw.Divider(color: _muted, thickness: 0.5),
                 pw.SizedBox(height: 8),
                 pw.Text(
-                  'Page 2 lists a table of contents. Every message '
-                  'below is numbered — tap an entry in the table of '
-                  'contents to jump straight to it.',
+                  'The next pages list a table of contents. Every '
+                  'message below is numbered — tap an entry in the '
+                  'table of contents to jump straight to it.',
                   style: const pw.TextStyle(fontSize: 9, color: _muted),
                 ),
               ],
@@ -214,101 +283,117 @@ class PdfExportService {
     );
   }
 
-  // ---- Table of contents ----
+  // ---- Table of contents (MultiPage — spills across as many pages
+  //      as needed instead of overflowing a single fixed page) ----
 
-  static pw.Page _tocPage(
+  static pw.MultiPage _tocPage(
     String folderName,
     List<Map<String, dynamic>> messages,
   ) {
-    return pw.Page(
+    return pw.MultiPage(
       pageFormat: PdfPageFormat.a4,
-      margin: const pw.EdgeInsets.fromLTRB(36, 44, 36, 40),
-      build: (ctx) => pw.Column(
-        crossAxisAlignment: pw.CrossAxisAlignment.start,
-        children: [
-          pw.Text(
-            'Table of Contents',
-            style: pw.TextStyle(
-                fontSize: 20, fontWeight: pw.FontWeight.bold, color: _ink),
-          ),
-          pw.SizedBox(height: 2),
-          pw.Text(
-            '${messages.length} message(s) in "$folderName"',
-            style: const pw.TextStyle(fontSize: 9, color: _muted),
-          ),
-          pw.SizedBox(height: 16),
-          pw.Expanded(
-            child: pw.ListView.builder(
-              itemCount: messages.length,
-              itemBuilder: (context, i) {
-                final m = messages[i];
-                final preview = _previewOf(m['text']?.toString() ?? '', 12);
-                final isUser = m['type'] == 'user';
-
-                return pw.Link(
-                  destination: 'msg_${m['id']}',
-                  child: pw.Container(
-                    margin: const pw.EdgeInsets.only(bottom: 6),
-                    padding: const pw.EdgeInsets.symmetric(
-                        horizontal: 10, vertical: 8),
-                    decoration: pw.BoxDecoration(
-                      color: i.isEven ? _accentSoft : PdfColors.white,
-                      borderRadius: pw.BorderRadius.circular(8),
-                    ),
-                    child: pw.Row(
-                      children: [
-                        pw.Container(
-                          width: 22,
-                          height: 22,
-                          alignment: pw.Alignment.center,
-                          decoration: const pw.BoxDecoration(
-                            color: _accent,
-                            shape: pw.BoxShape.circle,
-                          ),
-                          child: pw.Text(
-                            '${i + 1}',
-                            style: pw.TextStyle(
-                                fontSize: 8,
-                                color: PdfColors.white,
-                                fontWeight: pw.FontWeight.bold),
-                          ),
-                        ),
-                        pw.SizedBox(width: 8),
-                        pw.Expanded(
-                          child: pw.Text(
-                            preview.isEmpty
-                                ? (m['type'] == 'image'
-                                    ? '[image]'
-                                    : '(empty)')
-                                : preview,
-                            style: const pw.TextStyle(fontSize: 10),
-                            maxLines: 1,
-                            overflow: pw.TextOverflow.clip,
-                          ),
-                        ),
-                        pw.SizedBox(width: 6),
-                        pw.Text(
-                          isUser ? 'You' : 'System',
-                          style: const pw.TextStyle(
-                              fontSize: 8, color: _muted),
-                        ),
-                      ],
-                    ),
+      margin: const pw.EdgeInsets.fromLTRB(36, 40, 36, 40),
+      header: (ctx) => pw.Padding(
+        padding: const pw.EdgeInsets.only(bottom: 10),
+        child: ctx.pageNumber == 1
+            ? pw.Column(
+                crossAxisAlignment: pw.CrossAxisAlignment.start,
+                children: [
+                  pw.Text(
+                    'Table of Contents',
+                    style: pw.TextStyle(
+                        fontSize: 20,
+                        fontWeight: pw.FontWeight.bold,
+                        color: _ink),
                   ),
-                );
-              },
+                  pw.SizedBox(height: 2),
+                  pw.Text(
+                    '${messages.length} message(s) in "$folderName"',
+                    style: const pw.TextStyle(fontSize: 9, color: _muted),
+                  ),
+                ],
+              )
+            : pw.Text(
+                folderName,
+                style: pw.TextStyle(
+                    fontSize: 10,
+                    fontWeight: pw.FontWeight.bold,
+                    color: _muted),
+              ),
+      ),
+      footer: (ctx) => pw.Container(
+        alignment: pw.Alignment.center,
+        padding: const pw.EdgeInsets.only(top: 6),
+        child: pw.Text(
+          '${ctx.pageNumber}',
+          style: const pw.TextStyle(fontSize: 8, color: _muted),
+        ),
+      ),
+      build: (ctx) => [
+        for (int i = 0; i < messages.length; i++) _tocRow(i, messages[i]),
+      ],
+    );
+  }
+
+  static pw.Widget _tocRow(int index, Map<String, dynamic> m) {
+    final preview = _previewOf(m['text']?.toString() ?? '', 12);
+    final isUser = m['source'] == 'user';
+
+    return pw.Link(
+      destination: 'msg_${m['id']}',
+      child: pw.Container(
+        margin: const pw.EdgeInsets.only(bottom: 6),
+        padding: const pw.EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+        decoration: pw.BoxDecoration(
+          color: index.isEven ? _accentSoft : PdfColors.white,
+          borderRadius: pw.BorderRadius.circular(8),
+        ),
+        child: pw.Row(
+          children: [
+            pw.Container(
+              width: 22,
+              height: 22,
+              alignment: pw.Alignment.center,
+              decoration: const pw.BoxDecoration(
+                color: _accent,
+                shape: pw.BoxShape.circle,
+              ),
+              child: pw.Text(
+                '${index + 1}',
+                style: pw.TextStyle(
+                    fontSize: 8,
+                    color: PdfColors.white,
+                    fontWeight: pw.FontWeight.bold),
+              ),
             ),
-          ),
-        ],
+            pw.SizedBox(width: 8),
+            pw.Expanded(
+              child: pw.Text(
+                preview.isEmpty
+                    ? (m['type'] == 'image' ? '[image]' : '(empty)')
+                    : preview,
+                style: const pw.TextStyle(fontSize: 10),
+                maxLines: 1,
+                overflow: pw.TextOverflow.clip,
+              ),
+            ),
+            pw.SizedBox(width: 6),
+            pw.Text(
+              isUser ? 'You' : 'System',
+              style: const pw.TextStyle(fontSize: 8, color: _muted),
+            ),
+          ],
+        ),
       ),
     );
   }
 
-  // ---- Body (numbered messages, page footer) ----
+  // ---- Body (numbered messages, page footer, embedded images) ----
 
   static pw.MultiPage _bodyPages(
     String folderName,
     List<Map<String, dynamic>> messages,
+    Map<String, pw.MemoryImage> imageCache,
   ) {
     return pw.MultiPage(
       pageFormat: PdfPageFormat.a4,
@@ -342,18 +427,24 @@ class PdfExportService {
         ),
       ),
       build: (ctx) => [
-        for (int i = 0; i < messages.length; i++) _messageBlock(i, messages[i]),
+        for (int i = 0; i < messages.length; i++)
+          _messageBlock(i, messages[i], imageCache),
       ],
     );
   }
 
-  static pw.Widget _messageBlock(int index, Map<String, dynamic> m) {
-    final isUser = m['type'] == 'user';
+  static pw.Widget _messageBlock(
+    int index,
+    Map<String, dynamic> m,
+    Map<String, pw.MemoryImage> imageCache,
+  ) {
+    final isUser = m['source'] == 'user';
     final isImage = m['type'] == 'image';
     final text = m['text']?.toString() ?? '';
     final ts = DateTime.tryParse(m['timestamp']?.toString() ?? '');
     final edited = m['edited'] == true;
     final important = m['important'] == true;
+    final image = isImage ? imageCache[m['id']] : null;
 
     return pw.Anchor(
       name: 'msg_${m['id']}',
@@ -410,14 +501,30 @@ class PdfExportService {
                   ),
               ],
             ),
-            pw.SizedBox(height: 5),
+            pw.SizedBox(height: 6),
             if (isImage)
-              pw.Text(
-                text.isEmpty ? '[image attachment]' : '[image] $text',
-                style: pw.TextStyle(
-                    fontSize: 10, fontStyle: pw.FontStyle.italic, color: _ink),
-              )
-            else
+              image != null
+                  ? pw.ClipRRect(
+                      horizontalRadius: 8,
+                      verticalRadius: 8,
+                      child: pw.Image(image, fit: pw.BoxFit.cover),
+                    )
+                  : pw.Text(
+                      '[image unavailable]',
+                      style: pw.TextStyle(
+                          fontSize: 10,
+                          fontStyle: pw.FontStyle.italic,
+                          color: _muted),
+                    ),
+            if (isImage && text.trim().isNotEmpty)
+              pw.Padding(
+                padding: const pw.EdgeInsets.only(top: 6),
+                child: pw.Text(
+                  text,
+                  style: const pw.TextStyle(fontSize: 10.5, lineSpacing: 2),
+                ),
+              ),
+            if (!isImage)
               pw.Text(
                 text,
                 style: const pw.TextStyle(fontSize: 10.5, lineSpacing: 2),

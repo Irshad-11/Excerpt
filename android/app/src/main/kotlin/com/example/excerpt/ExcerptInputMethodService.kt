@@ -15,6 +15,7 @@ import android.graphics.PixelFormat
 import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
 import android.graphics.drawable.RippleDrawable
+import android.hardware.display.DisplayManager
 import android.inputmethodservice.InputMethodService
 import android.os.Build
 import android.os.Handler
@@ -23,6 +24,7 @@ import android.provider.Settings
 import android.text.InputType
 import android.text.TextUtils
 import android.util.Log
+import android.view.Display
 import android.view.Gravity
 import android.view.View
 import android.view.ViewGroup
@@ -73,6 +75,15 @@ class ExcerptInputMethodService : InputMethodService() {
     private lateinit var prefs: android.content.SharedPreferences
     private lateinit var databaseHelper: ExcerptDatabaseHelper
 
+    // IMPORTANT: this WindowManager is obtained from a dedicated
+    // TYPE_APPLICATION_OVERLAY window context (see
+    // createOverlayWindowManager()), NOT from the IME service's own
+    // context. On Android 13+, a Context's WindowManager must be used
+    // only with the window type that Context was created for — the
+    // IME service's own context is bound to TYPE_INPUT_METHOD, so
+    // using it to add a TYPE_APPLICATION_OVERLAY window throws /
+    // behaves unreliably (this was the cause of the overlay randomly
+    // failing, then not showing at all).
     private var windowManager: WindowManager? = null
     private var overlayRoot: View? = null
 
@@ -115,12 +126,39 @@ class ExcerptInputMethodService : InputMethodService() {
         prefs = getSharedPreferences(Prefs.NAME, Context.MODE_PRIVATE)
         databaseHelper = ExcerptDatabaseHelper(this)
         clipboardManager = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
-        windowManager = getSystemService(Context.WINDOW_SERVICE) as WindowManager
+        windowManager = createOverlayWindowManager()
 
         clipboardManager.addPrimaryClipChangedListener(clipboardListener)
 
         createNotificationChannel()
         updateKeyboardNotification()
+    }
+
+    /**
+     * Builds a WindowManager tied to a context created specifically
+     * for TYPE_APPLICATION_OVERLAY windows (Android R+ API), so its
+     * window type always matches the LayoutParams type used in
+     * showOverlay(). Falls back to the plain service WindowManager on
+     * older Android versions, where this strict matching isn't
+     * enforced.
+     */
+    private fun createOverlayWindowManager(): WindowManager {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            try {
+                val displayManager = getSystemService(Context.DISPLAY_SERVICE) as DisplayManager
+                val display = displayManager.getDisplay(Display.DEFAULT_DISPLAY)
+                val displayContext = applicationContext.createDisplayContext(display)
+                val overlayContext = displayContext.createWindowContext(
+                    WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
+                    null
+                )
+                return overlayContext.getSystemService(Context.WINDOW_SERVICE) as WindowManager
+            } catch (e: Exception) {
+                Log.e(TAG, "Could not create dedicated overlay window context, falling back", e)
+            }
+        }
+
+        return getSystemService(Context.WINDOW_SERVICE) as WindowManager
     }
 
     // ============================================================
@@ -506,10 +544,16 @@ class ExcerptInputMethodService : InputMethodService() {
             put("folder_id", folderId)
             put("text", text)
             put("type", type)
+            // The overlay only ever captures clipboard text on behalf
+            // of the user — it always came from "outside", so it's
+            // always source='system', never the SQLite column default
+            // of 'user' (which is for composer-typed messages).
+            put("source", "system")
             put("timestamp", isoTimestamp())
             put("important", 0)
             put("edited", 0)
             putNull("extra")
+            putNull("image_path")
         }
 
         val inserted = db.insert("messages", null, values)
@@ -867,7 +911,7 @@ class ExcerptInputMethodService : InputMethodService() {
     }
 
     private fun commitSave(folder: String) {
-        appendMessage(folder, capturedText, "system")
+        appendMessage(folder, capturedText, "text")
         showSuccessContent(folder)
     }
 

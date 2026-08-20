@@ -5,11 +5,15 @@
 
     <uses-permission
         android:name="android.permission.POST_NOTIFICATIONS" />
+    
+    <uses-permission
+    android:name="android.permission.WRITE_EXTERNAL_STORAGE"
+    android:maxSdkVersion="28" />
 
     <application
         android:label="Excerpt"
         android:name="${applicationName}"
-        android:icon="@mipmap/ic_launcher"
+        android:icon="@mipmap/launcher_icon"
         android:allowBackup="false"
         android:supportsRtl="true">
 
@@ -53,6 +57,40 @@
                 android:resource="@xml/ime_method" />
 
         </service>
+
+        <!--
+  ADD this <activity> block inside <application>...</application> in
+  android/app/src/main/AndroidManifest.xml — right after the existing
+  <service android:name=".ExcerptInputMethodService" ...>...</service>
+  block works well. Do not remove anything already there.
+-->
+<activity
+    android:name=".ShareReceiverActivity"
+    android:exported="true"
+    android:theme="@android:style/Theme.Translucent.NoTitleBar"
+    android:excludeFromRecents="true"
+    android:taskAffinity=""
+    android:launchMode="singleTask">
+
+    <intent-filter>
+        <action android:name="android.intent.action.SEND" />
+        <category android:name="android.intent.category.DEFAULT" />
+        <data android:mimeType="text/plain" />
+    </intent-filter>
+
+    <intent-filter>
+        <action android:name="android.intent.action.SEND" />
+        <category android:name="android.intent.category.DEFAULT" />
+        <data android:mimeType="image/*" />
+    </intent-filter>
+
+    <intent-filter>
+        <action android:name="android.intent.action.SEND_MULTIPLE" />
+        <category android:name="android.intent.category.DEFAULT" />
+        <data android:mimeType="image/*" />
+    </intent-filter>
+
+</activity>
 
         <meta-data
             android:name="flutterEmbedding"

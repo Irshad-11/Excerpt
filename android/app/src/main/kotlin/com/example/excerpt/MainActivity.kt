@@ -1,11 +1,15 @@
 package com.example.excerpt
 
 import android.app.Activity
+import android.content.ContentValues
 import android.content.Context
 import android.content.Intent
 import android.database.Cursor
+import android.media.MediaScannerConnection
 import android.net.Uri
 import android.os.Build
+import android.os.Environment
+import android.provider.MediaStore
 import android.provider.OpenableColumns
 import android.provider.Settings
 import android.view.inputmethod.InputMethodManager
@@ -17,6 +21,8 @@ import io.flutter.embedding.android.FlutterActivity
 import io.flutter.embedding.engine.FlutterEngine
 import io.flutter.plugin.common.MethodChannel
 import java.io.File
+import java.net.URLConnection
+import java.util.Locale
 
 class MainActivity : FlutterActivity() {
 
@@ -188,6 +194,21 @@ class MainActivity : FlutterActivity() {
                     pickImportFile()
                 }
 
+                // =================================================
+                // Save an image into the device's public gallery
+                // =================================================
+
+                "saveImageToGallery" -> {
+                    val path = call.arguments as String
+
+                    try {
+                        saveImageToGallery(path)
+                        result.success(null)
+                    } catch (e: Exception) {
+                        result.error("SAVE_IMAGE_ERROR", e.message, null)
+                    }
+                }
+
                 else -> {
                     result.notImplemented()
                 }
@@ -247,11 +268,34 @@ class MainActivity : FlutterActivity() {
     }
 
     // =====================================================
-    // Data export — hand the file to the OS share sheet
+    // Mimetype detection — shared by shareFile() and
+    // saveImageToGallery(). Falls back to a URLConnection guess for
+    // anything not explicitly listed.
+    // =====================================================
+
+    private fun guessMimeType(file: File): String {
+        val ext = file.extension.lowercase(Locale.US)
+
+        return when (ext) {
+            "json" -> "application/json"
+            "pdf" -> "application/pdf"
+            "png" -> "image/png"
+            "jpg", "jpeg" -> "image/jpeg"
+            "webp" -> "image/webp"
+            "gif" -> "image/gif"
+            else -> URLConnection.guessContentTypeFromName(file.name) ?: "*/*"
+        }
+    }
+
+    // =====================================================
+    // Share — hand any app file (export JSON, PDF, an image, ...)
+    // to the OS share sheet with the correct mimetype, instead of
+    // always being hardcoded to application/json.
     // =====================================================
 
     private fun shareFile(path: String) {
         val file = File(path)
+        val mimeType = guessMimeType(file)
 
         val uri: Uri = FileProvider.getUriForFile(
             this,
@@ -260,12 +304,84 @@ class MainActivity : FlutterActivity() {
         )
 
         val intent = Intent(Intent.ACTION_SEND).apply {
-            type = "application/json"
+            type = mimeType
             putExtra(Intent.EXTRA_STREAM, uri)
             addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
         }
 
-        startActivity(Intent.createChooser(intent, "Export Excerpt data"))
+        startActivity(Intent.createChooser(intent, "Share via Excerpt"))
+    }
+
+    // =====================================================
+    // Save an image (from the app's private storage) into the
+    // device's public gallery, under Pictures/Excerpt.
+    // =====================================================
+
+    private fun saveImageToGallery(path: String) {
+        val file = File(path)
+        if (!file.exists()) {
+            throw IllegalStateException("Image file not found")
+        }
+
+        val mimeType = guessMimeType(file)
+        val displayName = file.name
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            saveImageToGalleryQAndAbove(file, displayName, mimeType)
+        } else {
+            saveImageToGalleryLegacy(file, displayName, mimeType)
+        }
+    }
+
+    private fun saveImageToGalleryQAndAbove(file: File, displayName: String, mimeType: String) {
+        val resolver = contentResolver
+
+        val values = ContentValues().apply {
+            put(MediaStore.Images.Media.DISPLAY_NAME, displayName)
+            put(MediaStore.Images.Media.MIME_TYPE, mimeType)
+            put(MediaStore.Images.Media.RELATIVE_PATH, "Pictures/Excerpt")
+            put(MediaStore.Images.Media.IS_PENDING, 1)
+        }
+
+        val collection = MediaStore.Images.Media.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY)
+        val uri = resolver.insert(collection, values)
+            ?: throw IllegalStateException("Could not create a gallery entry")
+
+        try {
+            resolver.openOutputStream(uri)?.use { out ->
+                file.inputStream().use { input -> input.copyTo(out) }
+            } ?: throw IllegalStateException("Could not open gallery output stream")
+
+            values.clear()
+            values.put(MediaStore.Images.Media.IS_PENDING, 0)
+            resolver.update(uri, values, null, null)
+        } catch (e: Exception) {
+            // Clean up the half-written MediaStore row on failure.
+            resolver.delete(uri, null, null)
+            throw e
+        }
+    }
+
+    @Suppress("DEPRECATION")
+    private fun saveImageToGalleryLegacy(file: File, displayName: String, mimeType: String) {
+        // Pre-Android 10 devices need the legacy public-directory
+        // write, which in turn needs WRITE_EXTERNAL_STORAGE (declared
+        // in the manifest with maxSdkVersion="28" — not needed, and
+        // not requestable, on API 29+).
+        val picturesDir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_PICTURES)
+        val excerptDir = File(picturesDir, "Excerpt")
+        if (!excerptDir.exists()) excerptDir.mkdirs()
+
+        val destFile = File(excerptDir, displayName)
+        file.copyTo(destFile, overwrite = true)
+
+        // Make the new file show up in the Gallery app immediately.
+        MediaScannerConnection.scanFile(
+            this,
+            arrayOf(destFile.absolutePath),
+            arrayOf(mimeType),
+            null
+        )
     }
 
     // =====================================================
