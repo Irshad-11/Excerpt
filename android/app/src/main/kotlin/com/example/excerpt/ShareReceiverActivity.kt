@@ -23,6 +23,7 @@ import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
 import android.widget.Toast
+import org.json.JSONArray
 import java.io.File
 import java.text.SimpleDateFormat
 import java.util.Locale
@@ -43,6 +44,16 @@ import java.util.UUID
  * Everything it saves is written with source = "system", same as the
  * IME overlay — from the app's point of view this content also
  * arrived "from outside", not typed in the composer.
+ *
+ * IMPORTANT: when 2+ images are shared together (ACTION_SEND_MULTIPLE,
+ * or in principle several images picked at once), they are written as
+ * a SINGLE grouped message — one row with `image_path` set to the
+ * first image and `image_paths` holding a JSON array of every image
+ * path — exactly like Flutter's FolderStore.appendImageGroupMessage.
+ * This mirrors the WhatsApp-style grouped bubble the UI renders
+ * (folder_screen.dart's imagePathsOf() falls back to [image_path]
+ * when `image_paths` is null, so single-image shares still work
+ * unchanged).
  */
 class ShareReceiverActivity : Activity() {
 
@@ -343,15 +354,21 @@ class ShareReceiverActivity : Activity() {
 
         try {
             if (sharedImageUris.isNotEmpty()) {
-                var savedCount = 0
+                // Copy every shared image into app storage first, then
+                // write them as ONE grouped message (not one message
+                // per image) — same shape as Flutter's
+                // appendImageGroupMessage: image_path = first image,
+                // image_paths = JSON array of all of them (only set
+                // when there's more than one).
+                val savedPaths = mutableListOf<String>()
                 for (uri in sharedImageUris) {
                     val savedPath = copyUriToAppStorage(uri) ?: continue
-                    appendImageMessage(folder, savedPath, caption)
-                    savedCount++
+                    savedPaths.add(savedPath)
                 }
-                if (savedCount == 0) {
+                if (savedPaths.isEmpty()) {
                     throw IllegalStateException("Could not read the shared image(s)")
                 }
+                appendImageGroupMessage(folder, savedPaths, caption)
             } else {
                 val text = sharedText.orEmpty()
                 val finalText = if (caption.isNotEmpty()) "$text\n\n$caption" else text
@@ -471,12 +488,26 @@ class ShareReceiverActivity : Activity() {
             put("edited", 0)
             putNull("extra")
             putNull("image_path")
+            putNull("image_paths")
         }
 
         db.insert("messages", null, values)
     }
 
-    private fun appendImageMessage(folder: String, imagePath: String, caption: String) {
+    /**
+     * Writes ALL shared images as a single grouped message (one DB
+     * row). `image_path` holds the first image (kept for legacy /
+     * single-image readers), and `image_paths` holds a JSON array of
+     * every image path — but only when there's more than one, so a
+     * single shared image stays indistinguishable from the old
+     * single-image path (matches Dart's appendImageGroupMessage /
+     * imagePathsOf() fallback logic in folder_screen.dart).
+     */
+    private fun appendImageGroupMessage(
+        folder: String,
+        imagePaths: List<String>,
+        caption: String
+    ) {
         val db = databaseHelper.writableDatabase
         val folderId = ensureFolder(folder)
 
@@ -490,7 +521,12 @@ class ShareReceiverActivity : Activity() {
             put("important", 0)
             put("edited", 0)
             putNull("extra")
-            put("image_path", imagePath)
+            put("image_path", imagePaths.first())
+            if (imagePaths.size > 1) {
+                put("image_paths", JSONArray(imagePaths).toString())
+            } else {
+                putNull("image_paths")
+            }
         }
 
         db.insert("messages", null, values)

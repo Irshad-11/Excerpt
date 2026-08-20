@@ -12,6 +12,45 @@ import 'search_screen.dart';
 // Folder screen — chat-style view with a composer + in-folder search
 // ================================================================
 
+/// Returns the full ordered list of image paths for a message.
+/// Grouped messages (2+ images) store them in `image_paths`;
+/// single-image / legacy messages only have `image_path`.
+List<String> imagePathsOf(Map<String, dynamic> message) {
+  final list = message['image_paths'];
+  if (list is List) return list.cast<String>();
+  final single = message['image_path'] as String?;
+  return single != null ? [single] : [];
+}
+
+/// Opens the gallery, saves picked images into the app's images
+/// directory, and returns their new on-disk paths. Shared by the
+/// composer's attach button and the edit screen's "add image" button.
+Future<List<String>> pickAndSaveImages() async {
+  final picker = ImagePicker();
+  final picked = await picker.pickMultiImage(imageQuality: 85);
+  if (picked.isEmpty) return [];
+
+  final base = await NativeBridge.getAppFilesDir();
+  final imagesDir = Directory(p.join(base, 'images'));
+  if (!await imagesDir.exists()) {
+    await imagesDir.create(recursive: true);
+  }
+
+  final saved = <String>[];
+  for (final asset in picked) {
+    final ext =
+        p.extension(asset.path).isEmpty ? '.jpg' : p.extension(asset.path);
+    final savedPath = p.join(
+      imagesDir.path,
+      '${DateTime.now().microsecondsSinceEpoch}_${asset.name}$ext'
+          .replaceAll(RegExp(r'\.{2,}'), '.'),
+    );
+    await File(asset.path).copy(savedPath);
+    saved.add(savedPath);
+  }
+  return saved;
+}
+
 class FolderScreen extends StatefulWidget {
   final String folderName;
   final String? initialMessageId;
@@ -34,6 +73,9 @@ class _FolderScreenState extends State<FolderScreen> {
   final Map<String, GlobalKey> _messageKeys = {};
 
   bool _sending = false;
+  bool _pickingImages = false;
+  final List<String> _pendingImages = [];
+
   bool _searchOpen = false;
   String _searchQuery = '';
   String? _highlightedMessageId;
@@ -109,6 +151,22 @@ class _FolderScreenState extends State<FolderScreen> {
   }
 
   // ---- Scroll to exact message ----
+  //
+  // Message bubbles vary a lot in height — a one-line text bubble vs.
+  // a WhatsApp-style multi-image grid can differ by 100+ px — so the
+  // old "index * average height" guess drifted further off the more
+  // image messages were in the folder. Once that guess missed badly
+  // enough, the target message was never within ListView.builder's
+  // lazily-built range, so its GlobalKey never got a context and the
+  // final Scrollable.ensureVisible() had nothing to lock onto — the
+  // view just stopped at the wrong place.
+  //
+  // Fix: don't trust a height guess at all. Jump to a proportional
+  // starting point, then walk the scroll position in viewport-sized
+  // steps toward the target, checking after every step whether its
+  // GlobalKey has actually been mounted yet. Once it has, fine-tune
+  // with Scrollable.ensureVisible. This works regardless of how tall
+  // any individual bubble is.
 
   Future<void> _scrollToMessage(String id, {bool closeSearch = true}) async {
     final index =
@@ -122,30 +180,15 @@ class _FolderScreenState extends State<FolderScreen> {
         _searchQuery = '';
       });
       _searchController.clear();
+      // Let the search panel's removal (it changes how much height
+      // the list gets) actually take effect before we touch scroll
+      // position — otherwise the very first jump below can be based
+      // on a layout that's about to change underneath it.
+      await Future.delayed(const Duration(milliseconds: 16));
     }
 
-    if (_scrollController.hasClients) {
-      final estimated = (index * 105.0)
-          .clamp(0.0, _scrollController.position.maxScrollExtent);
-      await _scrollController.animateTo(
-        estimated,
-        duration: const Duration(milliseconds: 320),
-        curve: Curves.easeOutCubic,
-      );
-    }
-
-    await Future.delayed(const Duration(milliseconds: 80));
     if (!mounted) return;
-
-    final key = _messageKeys[id];
-    if (key?.currentContext != null) {
-      await Scrollable.ensureVisible(
-        key!.currentContext!,
-        duration: const Duration(milliseconds: 420),
-        curve: Curves.easeInOutCubic,
-        alignment: 0.35,
-      );
-    }
+    await _bringMessageIntoView(id, index);
 
     if (!mounted) return;
     setState(() => _highlightedMessageId = id);
@@ -158,63 +201,110 @@ class _FolderScreenState extends State<FolderScreen> {
     });
   }
 
-  // ---- Send text ----
+  /// Walks the scroll position toward message [index] (with id [id])
+  /// until its bubble is actually built, then centers it precisely.
+  /// Height-agnostic by design — see the note above _scrollToMessage.
+  Future<void> _bringMessageIntoView(String id, int index) async {
+    if (!_scrollController.hasClients) return;
 
-  Future<void> _send() async {
-    final text = _composerController.text.trim();
-    if (text.isEmpty || _sending) return;
+    final denom = (_messages.length - 1).clamp(1, 1 << 30);
+    final fraction = index / denom;
 
-    setState(() => _sending = true);
-    await FolderStore.appendUserMessage(widget.folderName, text);
-    _composerController.clear();
-    await _load(scrollToEnd: true);
-    if (mounted) setState(() => _sending = false);
+    final maxExtentStart = _scrollController.position.maxScrollExtent;
+    final viewport = _scrollController.position.viewportDimension;
+
+    // Rough starting point so we don't have to walk one screen at a
+    // time from the top for messages near the end of a long folder.
+    final startTarget =
+        (fraction * maxExtentStart).clamp(0.0, maxExtentStart);
+    _scrollController.jumpTo(startTarget);
+    await Future.delayed(const Duration(milliseconds: 60));
+    if (!mounted) return;
+
+    final step = viewport > 0 ? viewport * 0.85 : 400.0;
+    const maxSteps = 30;
+
+    for (var i = 0; i < maxSteps; i++) {
+      final key = _messageKeys[id];
+      if (key?.currentContext != null) break;
+      if (!_scrollController.hasClients) return;
+
+      final pixels = _scrollController.position.pixels;
+      final maxExtent = _scrollController.position.maxScrollExtent;
+      if (maxExtent <= 0) break;
+
+      final targetGuess = (fraction * maxExtent).clamp(0.0, maxExtent);
+      final next = targetGuess >= pixels
+          ? (pixels + step).clamp(0.0, maxExtent)
+          : (pixels - step).clamp(0.0, maxExtent);
+
+      if (next == pixels) break; // hit the top/bottom edge — nothing left to try
+
+      _scrollController.jumpTo(next);
+      await Future.delayed(const Duration(milliseconds: 60));
+      if (!mounted) return;
+    }
+
+    final key = _messageKeys[id];
+    if (key?.currentContext != null) {
+      await Scrollable.ensureVisible(
+        key!.currentContext!,
+        duration: const Duration(milliseconds: 320),
+        curve: Curves.easeInOutCubic,
+        alignment: 0.35,
+      );
+    }
   }
 
-  // ---- Send image(s) — multi-select from gallery ----
+  // ---- Send (text and/or a grouped image message) ----
 
-  Future<void> _pickAndSendImage() async {
-    final picker = ImagePicker();
-    final picked = await picker.pickMultiImage(imageQuality: 85);
-    if (picked.isEmpty) return;
+  Future<void> _send() async {
+    if (_sending) return;
+
+    final text = _composerController.text.trim();
+    final images = List<String>.from(_pendingImages);
+    if (text.isEmpty && images.isEmpty) return;
 
     setState(() => _sending = true);
-
     try {
-      final base = await NativeBridge.getAppFilesDir();
-      final imagesDir = Directory(p.join(base, 'images'));
-      if (!await imagesDir.exists()) {
-        await imagesDir.create(recursive: true);
-      }
-
-      for (final asset in picked) {
-        final ext =
-            p.extension(asset.path).isEmpty ? '.jpg' : p.extension(asset.path);
-        final savedPath = p.join(
-          imagesDir.path,
-          '${DateTime.now().microsecondsSinceEpoch}_${asset.name}$ext'
-              .replaceAll(RegExp(r'\.{2,}'), '.'),
-        );
-        await File(asset.path).copy(savedPath);
-
-        // This image was picked and sent by the user, inside the
-        // app — always source: 'user'.
-        await FolderStore.appendImageMessage(
+      if (images.isNotEmpty) {
+        await FolderStore.appendImageGroupMessage(
           widget.folderName,
-          savedPath,
-          source: 'user',
+          images,
+          caption: text,
         );
+      } else {
+        await FolderStore.appendUserMessage(widget.folderName, text);
       }
-
+      _composerController.clear();
+      _pendingImages.clear();
       await _load(scrollToEnd: true);
+    } finally {
+      if (mounted) setState(() => _sending = false);
+    }
+  }
+
+  // ---- Composer image attach (stages images, doesn't send yet) ----
+
+  Future<void> _pickImagesForComposer() async {
+    setState(() => _pickingImages = true);
+    try {
+      final added = await pickAndSaveImages();
+      if (added.isNotEmpty && mounted) {
+        setState(() => _pendingImages.addAll(added));
+      }
     } catch (e) {
       if (mounted) {
         ScaffoldMessenger.of(context)
             .showSnackBar(SnackBar(content: Text('Could not add image: $e')));
       }
     } finally {
-      if (mounted) setState(() => _sending = false);
+      if (mounted) setState(() => _pickingImages = false);
     }
+  }
+
+  void _removePendingImage(String path) {
+    setState(() => _pendingImages.remove(path));
   }
 
   // ---- Selection mode ----
@@ -277,20 +367,27 @@ class _FolderScreenState extends State<FolderScreen> {
         .showSnackBar(SnackBar(content: Text('Copied to "$target"')));
   }
 
-  // ---- Single message actions ----
+  // ---- Bubble tap dispatch ----
+  //
+  // Tapping the bubble's border/header/caption/timestamp opens the
+  // actions sheet (copy/edit/important/select/delete). Tapping an
+  // individual image thumbnail opens the full-screen viewer instead.
+  // In selection mode BOTH areas just toggle selection.
 
-  void _onBubbleTap(Map<String, dynamic> message) {
+  void _onBubbleBorderTap(Map<String, dynamic> message) {
     if (_selectionMode) {
       _toggleSelected(message['id'] as String);
       return;
     }
+    _showMessageActions(message);
+  }
 
-    if (message['type'] == 'image') {
-      _openImageViewer(message);
+  void _onImageThumbTap(Map<String, dynamic> message, String path) {
+    if (_selectionMode) {
+      _toggleSelected(message['id'] as String);
       return;
     }
-
-    _showMessageActions(message);
+    _openImageViewer(message, path);
   }
 
   void _onBubbleLongPress(Map<String, dynamic> message) {
@@ -299,18 +396,39 @@ class _FolderScreenState extends State<FolderScreen> {
   }
 
   // ---- Full-screen image viewer ----
+  //
+  // Flattens every image across every image-type message in the
+  // folder (in order) into one swipeable gallery, opening at the
+  // exact thumbnail that was tapped. This keeps the "swipe through
+  // everything" behaviour while still knowing which images belong
+  // to which message (needed to delete a single image out of a
+  // grouped message without deleting the whole message).
 
-  void _openImageViewer(Map<String, dynamic> tappedMessage) async {
-    final images = _messages.where((m) => m['type'] == 'image').toList();
-    final startIndex =
-        images.indexWhere((m) => m['id'] == tappedMessage['id']);
+  List<Map<String, dynamic>> _flattenImages() {
+    final result = <Map<String, dynamic>>[];
+    for (final m in _messages) {
+      if (m['type'] != 'image') continue;
+      final id = m['id'] as String;
+      final caption = m['text'] as String? ?? '';
+      for (final path in imagePathsOf(m)) {
+        result.add({'messageId': id, 'path': path, 'caption': caption});
+      }
+    }
+    return result;
+  }
+
+  void _openImageViewer(Map<String, dynamic> message, String tappedPath) async {
+    final flat = _flattenImages();
+    final startIndex = flat.indexWhere(
+      (e) => e['messageId'] == message['id'] && e['path'] == tappedPath,
+    );
 
     final changed = await Navigator.push<bool>(
       context,
       MaterialPageRoute(
         builder: (_) => _ImageViewerScreen(
           folderName: widget.folderName,
-          images: images,
+          images: flat,
           initialIndex: startIndex < 0 ? 0 : startIndex,
         ),
         fullscreenDialog: true,
@@ -324,6 +442,8 @@ class _FolderScreenState extends State<FolderScreen> {
     final id = message['id'] as String;
     final text = message['text'] as String? ?? '';
     final important = message['important'] == true;
+    final isImage = message['type'] == 'image';
+    final showCopy = !isImage || text.trim().isNotEmpty;
 
     await showModalBottomSheet(
       context: context,
@@ -345,23 +465,24 @@ class _FolderScreenState extends State<FolderScreen> {
                 ),
               ),
               const SizedBox(height: 8),
-              ListTile(
-                leading: const Icon(Icons.copy_rounded),
-                title: const Text('Copy'),
-                onTap: () {
-                  Clipboard.setData(ClipboardData(text: text));
-                  Navigator.pop(ctx);
-                  ScaffoldMessenger.of(context).showSnackBar(
-                    const SnackBar(content: Text('Copied to clipboard')),
-                  );
-                },
-              ),
+              if (showCopy)
+                ListTile(
+                  leading: const Icon(Icons.copy_rounded),
+                  title: const Text('Copy'),
+                  onTap: () {
+                    Clipboard.setData(ClipboardData(text: text));
+                    Navigator.pop(ctx);
+                    ScaffoldMessenger.of(context).showSnackBar(
+                      const SnackBar(content: Text('Copied to clipboard')),
+                    );
+                  },
+                ),
               ListTile(
                 leading: const Icon(Icons.edit_outlined),
                 title: const Text('Edit'),
                 onTap: () {
                   Navigator.pop(ctx);
-                  _editMessage(id, text);
+                  _editMessage(message);
                 },
               ),
               ListTile(
@@ -410,22 +531,50 @@ class _FolderScreenState extends State<FolderScreen> {
     );
   }
 
-  /// Large, full-screen edit box — never cramped, works well for
-  /// long messages in any script.
-  Future<void> _editMessage(String id, String currentText) async {
-    final newText = await Navigator.push<String>(
+  /// Full-screen editor. For image messages it also shows the
+  /// attached thumbnails (remove via ✕, add more via the + tile).
+  Future<void> _editMessage(Map<String, dynamic> message) async {
+    final id = message['id'] as String;
+    final currentText = message['text'] as String? ?? '';
+    final isImage = message['type'] == 'image';
+    final currentImages = isImage ? imagePathsOf(message) : <String>[];
+
+    final result = await Navigator.push<_EditResult>(
       context,
       MaterialPageRoute(
-        builder: (_) => _EditMessageScreen(initialText: currentText),
+        builder: (_) => _EditMessageScreen(
+          initialText: currentText,
+          initialImages: currentImages,
+          allowImages: isImage,
+        ),
       ),
     );
 
-    if (newText == null || newText.trim().isEmpty || newText == currentText) {
-      return;
-    }
+    if (result == null) return;
 
-    await FolderStore.updateMessageText(widget.folderName, id, newText);
+    final newText = result.text.trim();
+    final textChanged = newText != currentText;
+    final imagesChanged =
+        isImage && !_sameStringList(result.images, currentImages);
+
+    if (!textChanged && !imagesChanged) return;
+
+    if (textChanged) {
+      await FolderStore.updateMessageText(widget.folderName, id, newText);
+    }
+    if (imagesChanged) {
+      await FolderStore.updateMessageImages(
+          widget.folderName, id, result.images);
+    }
     await _load();
+  }
+
+  bool _sameStringList(List<String> a, List<String> b) {
+    if (a.length != b.length) return false;
+    for (var i = 0; i < a.length; i++) {
+      if (a[i] != b[i]) return false;
+    }
+    return true;
   }
 
   Future<bool?> _confirmDialog({
@@ -661,14 +810,15 @@ class _FolderScreenState extends State<FolderScreen> {
                             timestamp: message['timestamp'] as String?,
                             isUser: isUser,
                             isImage: isImage,
-                            imagePath: message['image_path'] as String?,
+                            imagePaths: isImage ? imagePathsOf(message) : const [],
                             important: message['important'] == true,
                             edited: message['edited'] == true,
                             selectionMode: _selectionMode,
                             selected: _selectedIds.contains(id),
                             highlighted: _highlightedMessageId == id,
                             searchQuery: _searchOpen ? _searchQuery : '',
-                            onTap: () => _onBubbleTap(message),
+                            onTap: () => _onBubbleBorderTap(message),
+                            onImageTap: (path) => _onImageThumbTap(message, path),
                             onLongPress: () => _onBubbleLongPress(message),
                           ),
                         );
@@ -680,8 +830,11 @@ class _FolderScreenState extends State<FolderScreen> {
             _Composer(
               controller: _composerController,
               sending: _sending,
+              pickingImages: _pickingImages,
+              pendingImages: _pendingImages,
               onSend: _send,
-              onAttachImage: _pickAndSendImage,
+              onAttachImage: _pickImagesForComposer,
+              onRemovePendingImage: _removePendingImage,
             ),
         ],
       ),
@@ -696,7 +849,7 @@ class _FolderScreenState extends State<FolderScreen> {
             ? TextField(
                 key: const ValueKey('folder-search'),
                 controller: _searchController,
-                autofocus: true,
+                autofocus: false,
                 textInputAction: TextInputAction.search,
                 decoration: const InputDecoration(
                   hintText: 'Search this chat',
@@ -749,15 +902,16 @@ class _FolderScreenState extends State<FolderScreen> {
 // Full-screen, swipeable multi-image viewer
 // ================================================================
 //
-// Opened by tapping any image bubble. Shows every image in the
-// folder (not just the tapped one) in a PageView so the user can
-// swipe through them like a gallery. Top bar: back button + a
-// three-dot menu with Download / Share / Delete, each fully wired.
+// Shows every image across the whole folder (not just one message)
+// in a PageView, opening at the exact thumbnail tapped. Each entry
+// tracks which message it came from so deleting one image out of a
+// grouped message doesn't delete the whole message. Top bar: back
+// button + a three-dot menu with Download / Share / Delete.
 // ================================================================
 
 class _ImageViewerScreen extends StatefulWidget {
   final String folderName;
-  final List<Map<String, dynamic>> images;
+  final List<Map<String, dynamic>> images; // {messageId, path, caption}
   final int initialIndex;
 
   const _ImageViewerScreen({
@@ -784,7 +938,7 @@ class _ImageViewerScreenState extends State<_ImageViewerScreen> {
   }
 
   String? get _currentPath =>
-      _images.isEmpty ? null : _images[_currentIndex]['image_path'] as String?;
+      _images.isEmpty ? null : _images[_currentIndex]['path'] as String?;
 
   Future<void> _download() async {
     final path = _currentPath;
@@ -819,9 +973,14 @@ class _ImageViewerScreenState extends State<_ImageViewerScreen> {
     }
   }
 
+  /// Removes just the current image. If it was the last image
+  /// belonging to its message, the whole message is deleted;
+  /// otherwise the message's image list is updated in place.
   Future<void> _delete() async {
-    final id = _images[_currentIndex]['id'] as String?;
-    if (id == null) return;
+    final entry = _images[_currentIndex];
+    final messageId = entry['messageId'] as String?;
+    final path = entry['path'] as String?;
+    if (messageId == null || path == null) return;
 
     final confirmed = await showDialog<bool>(
       context: context,
@@ -844,9 +1003,19 @@ class _ImageViewerScreenState extends State<_ImageViewerScreen> {
 
     if (confirmed != true) return;
 
-    await FolderStore.deleteMessages(widget.folderName, {id});
-    _changed = true;
+    final remaining = _images
+        .where((e) => e['messageId'] == messageId && e['path'] != path)
+        .map((e) => e['path'] as String)
+        .toList();
 
+    if (remaining.isEmpty) {
+      await FolderStore.deleteMessages(widget.folderName, {messageId});
+    } else {
+      await FolderStore.updateMessageImages(
+          widget.folderName, messageId, remaining);
+    }
+
+    _changed = true;
     if (!mounted) return;
 
     setState(() {
@@ -962,8 +1131,8 @@ class _ImageViewerScreenState extends State<_ImageViewerScreen> {
                 itemCount: _images.length,
                 onPageChanged: (index) => setState(() => _currentIndex = index),
                 itemBuilder: (context, index) {
-                  final path = _images[index]['image_path'] as String?;
-                  final caption = _images[index]['text'] as String? ?? '';
+                  final path = _images[index]['path'] as String?;
+                  final caption = _images[index]['caption'] as String? ?? '';
 
                   return Column(
                     children: [
@@ -1007,12 +1176,27 @@ class _ImageViewerScreenState extends State<_ImageViewerScreen> {
 
 // ================================================================
 // Full-screen message editor — deliberately NOT a small dialog box,
-// so long messages in any script stay easy to read and edit.
+// so long messages in any script stay easy to read and edit. Also
+// manages attached images (remove existing / add new) when
+// [allowImages] is true.
 // ================================================================
+
+class _EditResult {
+  final String text;
+  final List<String> images;
+  const _EditResult(this.text, this.images);
+}
 
 class _EditMessageScreen extends StatefulWidget {
   final String initialText;
-  const _EditMessageScreen({required this.initialText});
+  final List<String> initialImages;
+  final bool allowImages;
+
+  const _EditMessageScreen({
+    required this.initialText,
+    this.initialImages = const [],
+    this.allowImages = false,
+  });
 
   @override
   State<_EditMessageScreen> createState() => _EditMessageScreenState();
@@ -1021,11 +1205,44 @@ class _EditMessageScreen extends StatefulWidget {
 class _EditMessageScreenState extends State<_EditMessageScreen> {
   late final TextEditingController _controller =
       TextEditingController(text: widget.initialText);
+  late final List<String> _images = List.of(widget.initialImages);
+  bool _addingImages = false;
 
   @override
   void dispose() {
     _controller.dispose();
     super.dispose();
+  }
+
+  void _removeImage(String path) {
+    setState(() => _images.remove(path));
+  }
+
+  Future<void> _addImages() async {
+    setState(() => _addingImages = true);
+    try {
+      final added = await pickAndSaveImages();
+      if (added.isNotEmpty && mounted) {
+        setState(() => _images.addAll(added));
+      }
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context)
+            .showSnackBar(SnackBar(content: Text('Could not add image: $e')));
+      }
+    } finally {
+      if (mounted) setState(() => _addingImages = false);
+    }
+  }
+
+  void _save() {
+    if (widget.allowImages && _images.isEmpty) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('At least one image is required')),
+      );
+      return;
+    }
+    Navigator.pop(context, _EditResult(_controller.text.trim(), _images));
   }
 
   @override
@@ -1034,27 +1251,151 @@ class _EditMessageScreenState extends State<_EditMessageScreen> {
       appBar: AppBar(
         title: const Text('Edit message'),
         actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(context, _controller.text.trim()),
-            child: const Text('Save'),
+          TextButton(onPressed: _save, child: const Text('Save')),
+        ],
+      ),
+      body: Column(
+        children: [
+          if (widget.allowImages) _buildImagesSection(),
+          Expanded(
+            child: Padding(
+              padding: const EdgeInsets.all(16),
+              child: TextField(
+                controller: _controller,
+                autofocus: !widget.allowImages,
+                expands: true,
+                maxLines: null,
+                minLines: null,
+                textAlignVertical: TextAlignVertical.top,
+                style: const TextStyle(fontSize: 16, height: 1.4),
+                decoration: InputDecoration(
+                  border: InputBorder.none,
+                  hintText:
+                      widget.allowImages ? 'Caption…' : 'Message text…',
+                ),
+              ),
+            ),
           ),
         ],
       ),
-      body: Padding(
-        padding: const EdgeInsets.all(16),
-        child: TextField(
-          controller: _controller,
-          autofocus: true,
-          expands: true,
-          maxLines: null,
-          minLines: null,
-          textAlignVertical: TextAlignVertical.top,
-          style: const TextStyle(fontSize: 16, height: 1.4),
-          decoration: const InputDecoration(
-            border: InputBorder.none,
-            hintText: 'Message text…',
-          ),
+    );
+  }
+
+  Widget _buildImagesSection() {
+    return Container(
+      padding: const EdgeInsets.fromLTRB(12, 12, 12, 4),
+      decoration: BoxDecoration(
+        border: Border(
+          bottom: BorderSide(color: Colors.grey.withOpacity(0.2)),
         ),
+      ),
+      child: SizedBox(
+        height: 88,
+        child: ListView(
+          scrollDirection: Axis.horizontal,
+          children: [
+            ..._images.map((path) => Padding(
+                  padding: const EdgeInsets.only(right: 10, top: 6),
+                  child: _EditableThumb(
+                    path: path,
+                    onRemove: () => _removeImage(path),
+                  ),
+                )),
+            Padding(
+              padding: const EdgeInsets.only(top: 6),
+              child: _AddImageButton(busy: _addingImages, onTap: _addImages),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+/// A small thumbnail with a ✕ button in the corner — used both in
+/// the edit screen and in the composer's pending-images preview.
+class _EditableThumb extends StatelessWidget {
+  final String path;
+  final VoidCallback onRemove;
+  final double size;
+
+  const _EditableThumb({
+    required this.path,
+    required this.onRemove,
+    this.size = 76,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return SizedBox(
+      width: size,
+      height: size,
+      child: Stack(
+        clipBehavior: Clip.none,
+        children: [
+          ClipRRect(
+            borderRadius: BorderRadius.circular(10),
+            child: Image.file(
+              File(path),
+              width: size,
+              height: size,
+              fit: BoxFit.cover,
+              errorBuilder: (_, __, ___) => Container(
+                width: size,
+                height: size,
+                color: Colors.grey.withOpacity(0.15),
+                alignment: Alignment.center,
+                child: const Icon(Icons.broken_image_outlined, size: 20),
+              ),
+            ),
+          ),
+          Positioned(
+            top: -6,
+            right: -6,
+            child: GestureDetector(
+              onTap: onRemove,
+              child: Container(
+                width: 22,
+                height: 22,
+                decoration: const BoxDecoration(
+                  color: Colors.black87,
+                  shape: BoxShape.circle,
+                ),
+                child: const Icon(Icons.close, color: Colors.white, size: 14),
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+/// A dashed-ish "+" tile that opens the picker to add more images.
+class _AddImageButton extends StatelessWidget {
+  final bool busy;
+  final VoidCallback onTap;
+  const _AddImageButton({required this.busy, required this.onTap});
+
+  @override
+  Widget build(BuildContext context) {
+    return GestureDetector(
+      onTap: busy ? null : onTap,
+      child: Container(
+        width: 76,
+        height: 76,
+        decoration: BoxDecoration(
+          color: Colors.grey.withOpacity(0.14),
+          borderRadius: BorderRadius.circular(10),
+        ),
+        alignment: Alignment.center,
+        child: busy
+            ? const SizedBox(
+                width: 20,
+                height: 20,
+                child: CircularProgressIndicator(strokeWidth: 2.2),
+              )
+            : const Icon(Icons.add_photo_alternate_outlined),
       ),
     );
   }
@@ -1067,82 +1408,129 @@ class _EditMessageScreenState extends State<_EditMessageScreen> {
 class _Composer extends StatelessWidget {
   final TextEditingController controller;
   final bool sending;
+  final bool pickingImages;
+  final List<String> pendingImages;
   final VoidCallback onSend;
   final VoidCallback onAttachImage;
+  final void Function(String path) onRemovePendingImage;
 
   const _Composer({
     required this.controller,
     required this.sending,
+    required this.pickingImages,
+    required this.pendingImages,
     required this.onSend,
     required this.onAttachImage,
+    required this.onRemovePendingImage,
   });
 
   @override
   Widget build(BuildContext context) {
     return SafeArea(
       top: false,
-      child: Padding(
-        padding: const EdgeInsets.fromLTRB(6, 8, 10, 10),
-        child: Row(
-          crossAxisAlignment: CrossAxisAlignment.end,
-          children: [
-            IconButton(
-              tooltip: 'Attach image(s)',
-              onPressed: sending ? null : onAttachImage,
-              icon: const Icon(Icons.image_outlined),
-            ),
-            Expanded(
-              child: Container(
-                constraints: const BoxConstraints(maxHeight: 120),
-                decoration: BoxDecoration(
-                  color: Colors.grey.withOpacity(0.12),
-                  borderRadius: BorderRadius.circular(22),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          if (pendingImages.isNotEmpty) _buildPendingImagesStrip(),
+          Padding(
+            padding: const EdgeInsets.fromLTRB(6, 8, 10, 10),
+            child: Row(
+              crossAxisAlignment: CrossAxisAlignment.end,
+              children: [
+                IconButton(
+                  tooltip: 'Attach image(s)',
+                  onPressed: (sending || pickingImages) ? null : onAttachImage,
+                  icon: pickingImages
+                      ? const SizedBox(
+                          width: 20,
+                          height: 20,
+                          child: CircularProgressIndicator(strokeWidth: 2.2),
+                        )
+                      : const Icon(Icons.image_outlined),
                 ),
-                child: TextField(
-                  controller: controller,
-                  minLines: 1,
-                  maxLines: 5,
-                  textCapitalization: TextCapitalization.sentences,
-                  decoration: const InputDecoration(
-                    hintText: 'Type a message…',
-                    border: InputBorder.none,
-                    contentPadding:
-                        EdgeInsets.symmetric(horizontal: 16, vertical: 12),
-                  ),
-                  onSubmitted: (_) => onSend(),
-                ),
-              ),
-            ),
-            const SizedBox(width: 8),
-            AnimatedSwitcher(
-              duration: const Duration(milliseconds: 150),
-              child: sending
-                  ? const Padding(
-                      key: ValueKey('loading'),
-                      padding: EdgeInsets.all(10),
-                      child: SizedBox(
-                        width: 22,
-                        height: 22,
-                        child: CircularProgressIndicator(strokeWidth: 2.4),
-                      ),
-                    )
-                  : IconButton.filled(
-                      key: const ValueKey('send'),
-                      onPressed: onSend,
-                      icon: const Icon(Icons.arrow_upward_rounded),
+                Expanded(
+                  child: Container(
+                    constraints: const BoxConstraints(maxHeight: 120),
+                    decoration: BoxDecoration(
+                      color: Colors.grey.withOpacity(0.12),
+                      borderRadius: BorderRadius.circular(22),
                     ),
+                    child: TextField(
+                      controller: controller,
+                      minLines: 1,
+                      maxLines: 5,
+                      textCapitalization: TextCapitalization.sentences,
+                      decoration: InputDecoration(
+                        hintText: pendingImages.isNotEmpty
+                            ? 'Add a caption…'
+                            : 'Type a message…',
+                        border: InputBorder.none,
+                        contentPadding: const EdgeInsets.symmetric(
+                            horizontal: 16, vertical: 12),
+                      ),
+                      onSubmitted: (_) => onSend(),
+                    ),
+                  ),
+                ),
+                const SizedBox(width: 8),
+                AnimatedSwitcher(
+                  duration: const Duration(milliseconds: 150),
+                  child: sending
+                      ? const Padding(
+                          key: ValueKey('loading'),
+                          padding: EdgeInsets.all(10),
+                          child: SizedBox(
+                            width: 22,
+                            height: 22,
+                            child: CircularProgressIndicator(strokeWidth: 2.4),
+                          ),
+                        )
+                      : IconButton.filled(
+                          key: const ValueKey('send'),
+                          onPressed: onSend,
+                          icon: const Icon(Icons.arrow_upward_rounded),
+                        ),
+                ),
+              ],
             ),
-          ],
-        ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildPendingImagesStrip() {
+    return Container(
+      height: 84,
+      margin: const EdgeInsets.fromLTRB(10, 8, 10, 0),
+      child: ListView.separated(
+        scrollDirection: Axis.horizontal,
+        itemCount: pendingImages.length,
+        separatorBuilder: (_, __) => const SizedBox(width: 8),
+        itemBuilder: (context, index) {
+          final path = pendingImages[index];
+          return _EditableThumb(
+            path: path,
+            onRemove: () => onRemovePendingImage(path),
+            size: 72,
+          );
+        },
       ),
     );
   }
 }
 
 // ================================================================
-// Message bubble — numbered, supports text or image content.
-// `isUser` now comes from the `source` field (who sent it), fully
-// independent from whether the content is text or an image.
+// Message bubble — numbered, supports text or (grouped) image
+// content. `isUser` comes from the `source` field (who sent it),
+// fully independent from whether the content is text or image(s).
+//
+// Tap targeting: `onTap` fires for the border/header/caption/
+// timestamp area (opens the actions sheet). `onImageTap` fires for
+// an individual image thumbnail (opens the gallery viewer). Nested
+// GestureDetectors around each thumbnail take priority over the
+// outer one for taps, while long-press still bubbles up to the
+// outer detector to enter selection mode from anywhere.
 // ================================================================
 
 class _MessageBubble extends StatelessWidget {
@@ -1151,7 +1539,7 @@ class _MessageBubble extends StatelessWidget {
   final String? timestamp;
   final bool isUser;
   final bool isImage;
-  final String? imagePath;
+  final List<String> imagePaths;
   final bool important;
   final bool edited;
   final bool selectionMode;
@@ -1159,6 +1547,7 @@ class _MessageBubble extends StatelessWidget {
   final bool highlighted;
   final String searchQuery;
   final VoidCallback onTap;
+  final void Function(String path) onImageTap;
   final VoidCallback onLongPress;
 
   const _MessageBubble({
@@ -1166,9 +1555,10 @@ class _MessageBubble extends StatelessWidget {
     required this.text,
     required this.isUser,
     required this.onTap,
+    required this.onImageTap,
     required this.onLongPress,
     this.isImage = false,
-    this.imagePath,
+    this.imagePaths = const [],
     this.timestamp,
     this.important = false,
     this.edited = false,
@@ -1272,26 +1662,7 @@ class _MessageBubble extends StatelessWidget {
               ],
             ),
           ),
-          if (isImage && imagePath != null)
-            ClipRRect(
-              borderRadius: BorderRadius.circular(12),
-              child: Hero(
-                tag: 'image_$imagePath',
-                child: Image.file(
-                  File(imagePath!),
-                  fit: BoxFit.cover,
-                  width: double.infinity,
-                  height: 180,
-                  errorBuilder: (_, __, ___) => Container(
-                    width: double.infinity,
-                    height: 120,
-                    color: Colors.grey.withOpacity(0.15),
-                    alignment: Alignment.center,
-                    child: const Icon(Icons.broken_image_outlined, size: 28),
-                  ),
-                ),
-              ),
-            ),
+          if (isImage && imagePaths.isNotEmpty) _buildImageGrid(context),
           if (isImage && text.trim().isNotEmpty)
             Padding(
               padding: const EdgeInsets.only(top: 6),
@@ -1381,6 +1752,88 @@ class _MessageBubble extends StatelessWidget {
           ),
           padding: const EdgeInsets.symmetric(horizontal: 2),
           child: row,
+        ),
+      ),
+    );
+  }
+
+  /// WhatsApp-style grid: 1 image = full width; 2 = side by side;
+  /// 3+ = a row of 3 with a dark "+N" overlay on the last tile if
+  /// there are more than 3 images in the group. Tapping in
+  /// selection mode toggles the whole message instead of opening
+  /// the viewer (handled by the caller via [onImageTap] /
+  /// selectionMode already being checked upstream — here we only
+  /// need to decide which behaviour to invoke).
+  Widget _buildImageGrid(BuildContext context) {
+    if (imagePaths.length == 1) {
+      return _imageTile(imagePaths[0], height: 180);
+    }
+
+    final visibleCount = imagePaths.length >= 3 ? 3 : 2;
+    final overlayCount =
+        imagePaths.length > 3 ? imagePaths.length - 3 : 0;
+
+    return Row(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: List.generate(visibleCount, (i) {
+        final isLastVisible = i == visibleCount - 1;
+        final showOverlay = isLastVisible && overlayCount > 0;
+        return Expanded(
+          child: Padding(
+            padding: EdgeInsets.only(left: i == 0 ? 0 : 4),
+            child: _imageTile(
+              imagePaths[i],
+              height: 140,
+              overlayText: showOverlay ? '+$overlayCount' : null,
+            ),
+          ),
+        );
+      }),
+    );
+  }
+
+  Widget _imageTile(
+    String path, {
+    required double height,
+    String? overlayText,
+  }) {
+    return GestureDetector(
+      onTap: () => onImageTap(path),
+      child: ClipRRect(
+        borderRadius: BorderRadius.circular(12),
+        child: Stack(
+          fit: StackFit.passthrough,
+          children: [
+            Hero(
+              tag: 'image_$path',
+              child: Image.file(
+                File(path),
+                fit: BoxFit.cover,
+                width: double.infinity,
+                height: height,
+                errorBuilder: (_, __, ___) => Container(
+                  width: double.infinity,
+                  height: height,
+                  color: Colors.grey.withOpacity(0.15),
+                  alignment: Alignment.center,
+                  child: const Icon(Icons.broken_image_outlined, size: 28),
+                ),
+              ),
+            ),
+            if (overlayText != null)
+              Container(
+                color: Colors.black.withOpacity(0.45),
+                alignment: Alignment.center,
+                child: Text(
+                  overlayText,
+                  style: const TextStyle(
+                    color: Colors.white,
+                    fontSize: 20,
+                    fontWeight: FontWeight.bold,
+                  ),
+                ),
+              ),
+          ],
         ),
       ),
     );

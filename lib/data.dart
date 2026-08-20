@@ -127,24 +127,28 @@ class OnboardingStore {
 //   type   — WHAT the message is:   'text' | 'image'
 //   source — WHO sent it:           'user' | 'system'
 //
-// Migration backfills existing rows: old type='system' -> source
-// 'system'; everything else defaults to source='user' (matches
-// reality, since every existing image was added by hand in the
-// composer). Old type='system'/'user' both collapse into type='text'.
+// v4 adds `image_paths` — a nullable TEXT column holding a JSON-
+// encoded list of image paths, used for GROUPED image messages
+// (multiple images sent/received as a single chat bubble). Existing
+// single-image rows are untouched: they keep using just `image_path`
+// and `image_paths` stays null. A message's full image list is
+// always: image_paths (if set) else [image_path] (if set) else [].
 //
 // IMPORTANT: android/.../ExcerptDatabaseHelper.kt mirrors this same
 // schema on the native side (same physical SQLite file) — its
 // DATABASE_VERSION and onUpgrade() must be bumped in lockstep with
 // this file, or the two sides silently disagree (this bit us once
 // already: a mismatched version made the native side treat the file
-// as a "downgrade" and quietly fail to read folders).
+// as a "downgrade" and quietly fail to read folders). `image_paths`
+// is a plain nullable column the native side never writes to, so it
+// is safe to add without touching the Kotlin side.
 // ================================================================
 
 class AppDatabase {
   AppDatabase._();
   static final AppDatabase instance = AppDatabase._();
 
-  static const int schemaVersion = 3;
+  static const int schemaVersion = 4;
 
   Database? _db;
   Future<Database>? _opening;
@@ -174,6 +178,7 @@ class AppDatabase {
         await _createV1(db);
         await _upgradeToV2(db);
         await _upgradeToV3(db);
+        await _upgradeToV4(db);
       },
       onUpgrade: (db, oldVersion, newVersion) async {
         if (oldVersion < 2) {
@@ -181,6 +186,9 @@ class AppDatabase {
         }
         if (oldVersion < 3) {
           await _upgradeToV3(db);
+        }
+        if (oldVersion < 4) {
+          await _upgradeToV4(db);
         }
       },
     );
@@ -241,6 +249,10 @@ class AppDatabase {
       await db.execute(
           "UPDATE messages SET type = 'text' WHERE type IN ('system', 'user')");
     }
+  }
+
+  Future<void> _upgradeToV4(Database db) async {
+    await _addColumnIfMissing(db, 'messages', 'image_paths', 'TEXT');
   }
 
   Future<bool> _addColumnIfMissing(
@@ -419,6 +431,7 @@ class FolderStore {
           'important': row['important'],
           'edited': row['edited'],
           'image_path': row['image_path'],
+          'image_paths': row['image_paths'],
         });
       }
 
@@ -506,6 +519,17 @@ class FolderStore {
   // ---- Messages ----
 
   static Map<String, dynamic> _rowToMessage(Map<String, dynamic> row) {
+    List<String>? imagePaths;
+    final raw = row['image_paths'] as String?;
+    if (raw != null && raw.isNotEmpty) {
+      try {
+        final decoded = jsonDecode(raw);
+        if (decoded is List) imagePaths = decoded.cast<String>();
+      } catch (_) {
+        imagePaths = null;
+      }
+    }
+
     return {
       'id': row['id'] as String,
       'text': row['text'] as String,
@@ -515,6 +539,11 @@ class FolderStore {
       'important': (row['important'] as int) == 1,
       'edited': (row['edited'] as int) == 1,
       'image_path': row['image_path'] as String?,
+      // Full list of images for a message. For a legacy / single-
+      // image message this is null and callers should fall back to
+      // [image_path]. Only set (non-null) for GROUPED messages
+      // (2+ images).
+      'image_paths': imagePaths,
     };
   }
 
@@ -544,6 +573,7 @@ class FolderStore {
     String type, {
     String source = 'user',
     String? imagePath,
+    List<String>? imagePaths,
   }) async {
     final db = await _db;
     final folderId = await _folderId(folder);
@@ -558,6 +588,7 @@ class FolderStore {
       'important': 0,
       'edited': 0,
       'image_path': imagePath,
+      'image_paths': imagePaths != null ? jsonEncode(imagePaths) : null,
     });
   }
 
@@ -571,9 +602,12 @@ class FolderStore {
     return _appendMessage(folder, text, 'text', source: 'user');
   }
 
-  /// An image attachment. [source] defaults to 'user' (composer /
-  /// picker) — the Android share-target writes 'system' directly to
-  /// SQLite for images that arrive via the OS share sheet.
+  /// A SINGLE image attachment. [source] defaults to 'user' (composer
+  /// / picker) — the Android share-target writes 'system' directly to
+  /// SQLite for images that arrive via the OS share sheet. Kept for
+  /// backward compatibility / single-image callers; for multiple
+  /// images sent together as one chat bubble use
+  /// [appendImageGroupMessage] instead.
   static Future<void> appendImageMessage(
     String folder,
     String imagePath, {
@@ -582,6 +616,56 @@ class FolderStore {
   }) {
     return _appendMessage(folder, caption, 'image',
         source: source, imagePath: imagePath);
+  }
+
+  /// Multiple images sent/received together as a SINGLE chat bubble
+  /// (WhatsApp-style grouped message), with one shared [caption].
+  /// A single-item list behaves identically to [appendImageMessage].
+  static Future<void> appendImageGroupMessage(
+    String folder,
+    List<String> imagePaths, {
+    String caption = '',
+    String source = 'user',
+  }) {
+    if (imagePaths.isEmpty) return Future.value();
+    return _appendMessage(
+      folder,
+      caption,
+      'image',
+      source: source,
+      imagePath: imagePaths.first,
+      imagePaths: imagePaths.length > 1 ? imagePaths : null,
+    );
+  }
+
+  /// Replaces the image list of an existing image message — used when
+  /// the user removes/adds images while editing, or deletes a single
+  /// image out of a grouped message from the full-screen viewer.
+  /// Pass an empty list to have the caller delete the whole message
+  /// instead (this method intentionally does not delete rows).
+  static Future<void> updateMessageImages(
+    String folder,
+    String id,
+    List<String> imagePaths,
+  ) async {
+    final db = await _db;
+
+    try {
+      final folderId = await _folderId(folder, create: false);
+      await db.update(
+        'messages',
+        {
+          'image_path': imagePaths.isNotEmpty ? imagePaths.first : null,
+          'image_paths':
+              imagePaths.length > 1 ? jsonEncode(imagePaths) : null,
+          'edited': 1,
+        },
+        where: 'folder_id = ? AND id = ?',
+        whereArgs: [folderId, id],
+      );
+    } on StateError {
+      // Folder disappeared under us — nothing to update.
+    }
   }
 
   static Future<void> deleteMessages(String folder, Set<String> ids) async {
@@ -649,6 +733,8 @@ class FolderStore {
     final db = await _db;
     final folderId = await _folderId(targetFolder);
 
+    final imagePaths = message['image_paths'];
+
     await db.insert('messages', {
       'id': '${DateTime.now().microsecondsSinceEpoch}_${message.hashCode}',
       'folder_id': folderId,
@@ -659,6 +745,8 @@ class FolderStore {
       'important': message['important'] == true ? 1 : 0,
       'edited': 0,
       'image_path': message['image_path'] as String?,
+      'image_paths':
+          imagePaths is List ? jsonEncode(imagePaths) : null,
     });
   }
 }
@@ -734,6 +822,7 @@ class ImportExportService {
                   'important': (m['important'] as int) == 1,
                   'edited': (m['edited'] as int) == 1,
                   'image_path': m['image_path'],
+                  'image_paths': m['image_paths'],
                 })
             .toList(),
       });
@@ -902,6 +991,7 @@ class ImportExportService {
             'important': m['important'] == true ? 1 : 0,
             'edited': m['edited'] == true ? 1 : 0,
             'image_path': m['image_path'] as String?,
+            'image_paths': m['image_paths'] as String?,
           });
           insertedMessages++;
         }
