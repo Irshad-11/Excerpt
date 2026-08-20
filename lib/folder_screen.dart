@@ -12,9 +12,6 @@ import 'search_screen.dart';
 // Folder screen — chat-style view with a composer + in-folder search
 // ================================================================
 
-/// Returns the full ordered list of image paths for a message.
-/// Grouped messages (2+ images) store them in `image_paths`;
-/// single-image / legacy messages only have `image_path`.
 List<String> imagePathsOf(Map<String, dynamic> message) {
   final list = message['image_paths'];
   if (list is List) return list.cast<String>();
@@ -22,9 +19,6 @@ List<String> imagePathsOf(Map<String, dynamic> message) {
   return single != null ? [single] : [];
 }
 
-/// Opens the gallery, saves picked images into the app's images
-/// directory, and returns their new on-disk paths. Shared by the
-/// composer's attach button and the edit screen's "add image" button.
 Future<List<String>> pickAndSaveImages() async {
   final picker = ImagePicker();
   final picked = await picker.pickMultiImage(imageQuality: 85);
@@ -87,7 +81,7 @@ class _FolderScreenState extends State<FolderScreen> {
   @override
   void initState() {
     super.initState();
-    _load();
+    _load(scrollToEnd: true); // চ্যাটে ঢোকার সাথে সাথে নিচে স্ক্রোল করবে
     _searchController.addListener(() {
       final value = _searchController.text;
       if (!mounted) return;
@@ -119,14 +113,7 @@ class _FolderScreenState extends State<FolderScreen> {
     });
 
     if (scrollToEnd) {
-      WidgetsBinding.instance.addPostFrameCallback((_) {
-        if (!_scrollController.hasClients) return;
-        _scrollController.animateTo(
-          _scrollController.position.maxScrollExtent,
-          duration: const Duration(milliseconds: 320),
-          curve: Curves.easeOutCubic,
-        );
-      });
+      _scrollToBottom();
     }
 
     if (!_initialTargetHandled && widget.initialMessageId != null) {
@@ -135,6 +122,13 @@ class _FolderScreenState extends State<FolderScreen> {
         _scrollToMessage(widget.initialMessageId!, closeSearch: false);
       });
     }
+  }
+
+  void _scrollToBottom() {
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!_scrollController.hasClients) return;
+      _scrollController.jumpTo(_scrollController.position.maxScrollExtent);
+    });
   }
 
   // ---- Search ----
@@ -151,22 +145,6 @@ class _FolderScreenState extends State<FolderScreen> {
   }
 
   // ---- Scroll to exact message ----
-  //
-  // Message bubbles vary a lot in height — a one-line text bubble vs.
-  // a WhatsApp-style multi-image grid can differ by 100+ px — so the
-  // old "index * average height" guess drifted further off the more
-  // image messages were in the folder. Once that guess missed badly
-  // enough, the target message was never within ListView.builder's
-  // lazily-built range, so its GlobalKey never got a context and the
-  // final Scrollable.ensureVisible() had nothing to lock onto — the
-  // view just stopped at the wrong place.
-  //
-  // Fix: don't trust a height guess at all. Jump to a proportional
-  // starting point, then walk the scroll position in viewport-sized
-  // steps toward the target, checking after every step whether its
-  // GlobalKey has actually been mounted yet. Once it has, fine-tune
-  // with Scrollable.ensureVisible. This works regardless of how tall
-  // any individual bubble is.
 
   Future<void> _scrollToMessage(String id, {bool closeSearch = true}) async {
     final index =
@@ -180,10 +158,6 @@ class _FolderScreenState extends State<FolderScreen> {
         _searchQuery = '';
       });
       _searchController.clear();
-      // Let the search panel's removal (it changes how much height
-      // the list gets) actually take effect before we touch scroll
-      // position — otherwise the very first jump below can be based
-      // on a layout that's about to change underneath it.
       await Future.delayed(const Duration(milliseconds: 16));
     }
 
@@ -201,9 +175,6 @@ class _FolderScreenState extends State<FolderScreen> {
     });
   }
 
-  /// Walks the scroll position toward message [index] (with id [id])
-  /// until its bubble is actually built, then centers it precisely.
-  /// Height-agnostic by design — see the note above _scrollToMessage.
   Future<void> _bringMessageIntoView(String id, int index) async {
     if (!_scrollController.hasClients) return;
 
@@ -213,8 +184,6 @@ class _FolderScreenState extends State<FolderScreen> {
     final maxExtentStart = _scrollController.position.maxScrollExtent;
     final viewport = _scrollController.position.viewportDimension;
 
-    // Rough starting point so we don't have to walk one screen at a
-    // time from the top for messages near the end of a long folder.
     final startTarget =
         (fraction * maxExtentStart).clamp(0.0, maxExtentStart);
     _scrollController.jumpTo(startTarget);
@@ -238,7 +207,7 @@ class _FolderScreenState extends State<FolderScreen> {
           ? (pixels + step).clamp(0.0, maxExtent)
           : (pixels - step).clamp(0.0, maxExtent);
 
-      if (next == pixels) break; // hit the top/bottom edge — nothing left to try
+      if (next == pixels) break;
 
       _scrollController.jumpTo(next);
       await Future.delayed(const Duration(milliseconds: 60));
@@ -256,7 +225,7 @@ class _FolderScreenState extends State<FolderScreen> {
     }
   }
 
-  // ---- Send (text and/or a grouped image message) ----
+  // ---- Send ----
 
   Future<void> _send() async {
     if (_sending) return;
@@ -284,7 +253,7 @@ class _FolderScreenState extends State<FolderScreen> {
     }
   }
 
-  // ---- Composer image attach (stages images, doesn't send yet) ----
+  // ---- Composer image attach ----
 
   Future<void> _pickImagesForComposer() async {
     setState(() => _pickingImages = true);
@@ -368,11 +337,6 @@ class _FolderScreenState extends State<FolderScreen> {
   }
 
   // ---- Bubble tap dispatch ----
-  //
-  // Tapping the bubble's border/header/caption/timestamp opens the
-  // actions sheet (copy/edit/important/select/delete). Tapping an
-  // individual image thumbnail opens the full-screen viewer instead.
-  // In selection mode BOTH areas just toggle selection.
 
   void _onBubbleBorderTap(Map<String, dynamic> message) {
     if (_selectionMode) {
@@ -396,13 +360,6 @@ class _FolderScreenState extends State<FolderScreen> {
   }
 
   // ---- Full-screen image viewer ----
-  //
-  // Flattens every image across every image-type message in the
-  // folder (in order) into one swipeable gallery, opening at the
-  // exact thumbnail that was tapped. This keeps the "swipe through
-  // everything" behaviour while still knowing which images belong
-  // to which message (needed to delete a single image out of a
-  // grouped message without deleting the whole message).
 
   List<Map<String, dynamic>> _flattenImages() {
     final result = <Map<String, dynamic>>[];
@@ -531,8 +488,6 @@ class _FolderScreenState extends State<FolderScreen> {
     );
   }
 
-  /// Full-screen editor. For image messages it also shows the
-  /// attached thumbnails (remove via ✕, add more via the + tile).
   Future<void> _editMessage(Map<String, dynamic> message) async {
     final id = message['id'] as String;
     final currentText = message['text'] as String? ?? '';
@@ -776,7 +731,7 @@ class _FolderScreenState extends State<FolderScreen> {
           _buildLocalSearchPanel(),
           Expanded(
             child: RefreshIndicator(
-              onRefresh: _load,
+              onRefresh: () => _load(scrollToEnd: false),
               child: _messages.isEmpty
                   ? ListView(
                       children: [
@@ -901,17 +856,10 @@ class _FolderScreenState extends State<FolderScreen> {
 // ================================================================
 // Full-screen, swipeable multi-image viewer
 // ================================================================
-//
-// Shows every image across the whole folder (not just one message)
-// in a PageView, opening at the exact thumbnail tapped. Each entry
-// tracks which message it came from so deleting one image out of a
-// grouped message doesn't delete the whole message. Top bar: back
-// button + a three-dot menu with Download / Share / Delete.
-// ================================================================
 
 class _ImageViewerScreen extends StatefulWidget {
   final String folderName;
-  final List<Map<String, dynamic>> images; // {messageId, path, caption}
+  final List<Map<String, dynamic>> images;
   final int initialIndex;
 
   const _ImageViewerScreen({
@@ -973,9 +921,6 @@ class _ImageViewerScreenState extends State<_ImageViewerScreen> {
     }
   }
 
-  /// Removes just the current image. If it was the last image
-  /// belonging to its message, the whole message is deleted;
-  /// otherwise the message's image list is updated in place.
   Future<void> _delete() async {
     final entry = _images[_currentIndex];
     final messageId = entry['messageId'] as String?;
@@ -1175,10 +1120,7 @@ class _ImageViewerScreenState extends State<_ImageViewerScreen> {
 }
 
 // ================================================================
-// Full-screen message editor — deliberately NOT a small dialog box,
-// so long messages in any script stay easy to read and edit. Also
-// manages attached images (remove existing / add new) when
-// [allowImages] is true.
+// Full-screen message editor
 // ================================================================
 
 class _EditResult {
@@ -1312,8 +1254,6 @@ class _EditMessageScreenState extends State<_EditMessageScreen> {
   }
 }
 
-/// A small thumbnail with a ✕ button in the corner — used both in
-/// the edit screen and in the composer's pending-images preview.
 class _EditableThumb extends StatelessWidget {
   final String path;
   final VoidCallback onRemove;
@@ -1371,7 +1311,6 @@ class _EditableThumb extends StatelessWidget {
   }
 }
 
-/// A dashed-ish "+" tile that opens the picker to add more images.
 class _AddImageButton extends StatelessWidget {
   final bool busy;
   final VoidCallback onTap;
@@ -1521,19 +1460,10 @@ class _Composer extends StatelessWidget {
 }
 
 // ================================================================
-// Message bubble — numbered, supports text or (grouped) image
-// content. `isUser` comes from the `source` field (who sent it),
-// fully independent from whether the content is text or image(s).
-//
-// Tap targeting: `onTap` fires for the border/header/caption/
-// timestamp area (opens the actions sheet). `onImageTap` fires for
-// an individual image thumbnail (opens the gallery viewer). Nested
-// GestureDetectors around each thumbnail take priority over the
-// outer one for taps, while long-press still bubbles up to the
-// outer detector to enter selection mode from anywhere.
+// Message bubble with Expandable "Read More" logic
 // ================================================================
 
-class _MessageBubble extends StatelessWidget {
+class _MessageBubble extends StatefulWidget {
   final int index;
   final String text;
   final String? timestamp;
@@ -1569,12 +1499,65 @@ class _MessageBubble extends StatelessWidget {
   });
 
   @override
+  State<_MessageBubble> createState() => _MessageBubbleState();
+}
+
+class _MessageBubbleState extends State<_MessageBubble> {
+  bool _isExpanded = false;
+  static const int _characterLimit = 200; // মেসেজের অক্ষরের লিমিট
+
+  Widget _buildTextWidget(Color? textColor) {
+    final text = widget.text;
+    final isLongText = text.length > _characterLimit;
+    final displayText = (_isExpanded || !isLongText)
+        ? text
+        : '${text.substring(0, _characterLimit)}... ';
+
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        widget.searchQuery.trim().isNotEmpty
+            ? HighlightedText(
+                text: displayText,
+                query: widget.searchQuery,
+                style: TextStyle(color: textColor),
+                highlightColor: widget.isUser
+                    ? Colors.amber.withOpacity(0.6)
+                    : Colors.amber.withOpacity(0.45),
+              )
+            : Text(displayText, style: TextStyle(color: textColor)),
+        if (isLongText)
+          GestureDetector(
+            onTap: () {
+              setState(() {
+                _isExpanded = !_isExpanded;
+              });
+            },
+            child: Padding(
+              padding: const EdgeInsets.only(top: 4),
+              child: Text(
+                _isExpanded ? 'Read Less' : 'Read More',
+                style: TextStyle(
+                  color: widget.isUser
+                      ? Colors.white.withOpacity(0.9)
+                      : Theme.of(context).colorScheme.primary,
+                  fontWeight: FontWeight.bold,
+                  fontSize: 12,
+                ),
+              ),
+            ),
+          ),
+      ],
+    );
+  }
+
+  @override
   Widget build(BuildContext context) {
     final scheme = Theme.of(context).colorScheme;
 
     final bubbleColor =
-        isUser ? scheme.primary : Colors.grey.withOpacity(0.14);
-    final textColor = isUser ? scheme.onPrimary : null;
+        widget.isUser ? scheme.primary : Colors.grey.withOpacity(0.14);
+    final textColor = widget.isUser ? scheme.onPrimary : null;
 
     final bubble = AnimatedContainer(
       duration: const Duration(milliseconds: 320),
@@ -1585,21 +1568,21 @@ class _MessageBubble extends StatelessWidget {
         maxWidth: MediaQuery.of(context).size.width * 0.75,
       ),
       decoration: BoxDecoration(
-        color: highlighted
-            ? Colors.amber.withOpacity(isUser ? 0.55 : 0.28)
+        color: widget.highlighted
+            ? Colors.amber.withOpacity(widget.isUser ? 0.55 : 0.28)
             : bubbleColor,
         borderRadius: BorderRadius.only(
           topLeft: const Radius.circular(16),
           topRight: const Radius.circular(16),
-          bottomLeft: Radius.circular(isUser ? 16 : 4),
-          bottomRight: Radius.circular(isUser ? 4 : 16),
+          bottomLeft: Radius.circular(widget.isUser ? 16 : 4),
+          bottomRight: Radius.circular(widget.isUser ? 4 : 16),
         ),
-        border: highlighted
+        border: widget.highlighted
             ? Border.all(color: Colors.amber.shade600, width: 2)
-            : important
+            : widget.important
                 ? Border.all(color: Colors.amber.shade600, width: 1.4)
                 : null,
-        boxShadow: highlighted
+        boxShadow: widget.highlighted
             ? [
                 BoxShadow(
                   color: Colors.amber.withOpacity(0.22),
@@ -1623,38 +1606,38 @@ class _MessageBubble extends StatelessWidget {
                   alignment: Alignment.center,
                   decoration: BoxDecoration(
                     shape: BoxShape.circle,
-                    color: (isUser ? scheme.onPrimary : scheme.primary)
+                    color: (widget.isUser ? scheme.onPrimary : scheme.primary)
                         .withOpacity(0.16),
                   ),
                   child: Text(
-                    '${index + 1}',
+                    '${widget.index + 1}',
                     style: TextStyle(
                       fontSize: 8,
                       fontWeight: FontWeight.bold,
-                      color: isUser ? textColor : scheme.primary,
+                      color: widget.isUser ? textColor : scheme.primary,
                     ),
                   ),
                 ),
                 const SizedBox(width: 5),
                 Icon(
-                  isImage
+                  widget.isImage
                       ? Icons.image_outlined
-                      : isUser
+                      : widget.isUser
                           ? Icons.person_rounded
                           : Icons.content_paste_rounded,
                   size: 12,
-                  color: isUser ? textColor : scheme.primary,
+                  color: widget.isUser ? textColor : scheme.primary,
                 ),
                 const SizedBox(width: 4),
                 Text(
-                  isUser ? 'You' : 'System',
+                  widget.isUser ? 'You' : 'System',
                   style: TextStyle(
                     fontSize: 10,
                     fontWeight: FontWeight.bold,
-                    color: isUser ? textColor : scheme.primary,
+                    color: widget.isUser ? textColor : scheme.primary,
                   ),
                 ),
-                if (important) ...[
+                if (widget.important) ...[
                   const SizedBox(width: 6),
                   Icon(Icons.star_rounded,
                       size: 13, color: Colors.amber.shade700),
@@ -1662,34 +1645,26 @@ class _MessageBubble extends StatelessWidget {
               ],
             ),
           ),
-          if (isImage && imagePaths.isNotEmpty) _buildImageGrid(context),
-          if (isImage && text.trim().isNotEmpty)
+          if (widget.isImage && widget.imagePaths.isNotEmpty)
+            _buildImageGrid(context),
+          if (widget.isImage && widget.text.trim().isNotEmpty)
             Padding(
               padding: const EdgeInsets.only(top: 6),
-              child: Text(text, style: TextStyle(color: textColor)),
+              child: _buildTextWidget(textColor),
             ),
-          if (!isImage)
-            searchQuery.trim().isNotEmpty
-                ? HighlightedText(
-                    text: text,
-                    query: searchQuery,
-                    style: TextStyle(color: textColor),
-                    highlightColor: isUser
-                        ? Colors.amber.withOpacity(0.6)
-                        : Colors.amber.withOpacity(0.45),
-                  )
-                : Text(text, style: TextStyle(color: textColor)),
-          if (timestamp != null || edited)
+          if (!widget.isImage) _buildTextWidget(textColor),
+          if (widget.timestamp != null || widget.edited)
             Padding(
               padding: const EdgeInsets.only(top: 4),
               child: Text(
                 [
-                  if (timestamp != null) _formatDateTime(timestamp!),
-                  if (edited) 'edited',
+                  if (widget.timestamp != null)
+                    _formatDateTime(widget.timestamp!),
+                  if (widget.edited) 'edited',
                 ].join(' \u00B7 '),
                 style: TextStyle(
                   fontSize: 10,
-                  color: isUser
+                  color: widget.isUser
                       ? scheme.onPrimary.withOpacity(0.7)
                       : Colors.grey,
                 ),
@@ -1701,23 +1676,23 @@ class _MessageBubble extends StatelessWidget {
 
     final row = Row(
       mainAxisAlignment:
-          isUser ? MainAxisAlignment.end : MainAxisAlignment.start,
+          widget.isUser ? MainAxisAlignment.end : MainAxisAlignment.start,
       crossAxisAlignment: CrossAxisAlignment.center,
       children: [
-        if (selectionMode) ...[
+        if (widget.selectionMode) ...[
           AnimatedContainer(
             duration: const Duration(milliseconds: 150),
             width: 22,
             height: 22,
             decoration: BoxDecoration(
               shape: BoxShape.circle,
-              color: selected ? scheme.primary : Colors.transparent,
+              color: widget.selected ? scheme.primary : Colors.transparent,
               border: Border.all(
-                color: selected ? scheme.primary : Colors.grey,
+                color: widget.selected ? scheme.primary : Colors.grey,
                 width: 1.6,
               ),
             ),
-            child: selected
+            child: widget.selected
                 ? const Icon(Icons.check, size: 15, color: Colors.white)
                 : null,
           ),
@@ -1741,13 +1716,13 @@ class _MessageBubble extends StatelessWidget {
         );
       },
       child: GestureDetector(
-        onTap: onTap,
-        onLongPress: onLongPress,
+        onTap: widget.onTap,
+        onLongPress: widget.onLongPress,
         behavior: HitTestBehavior.opaque,
         child: AnimatedContainer(
           duration: const Duration(milliseconds: 150),
           decoration: BoxDecoration(
-            color: selected ? scheme.primary.withOpacity(0.08) : null,
+            color: widget.selected ? scheme.primary.withOpacity(0.08) : null,
             borderRadius: BorderRadius.circular(14),
           ),
           padding: const EdgeInsets.symmetric(horizontal: 2),
@@ -1757,21 +1732,14 @@ class _MessageBubble extends StatelessWidget {
     );
   }
 
-  /// WhatsApp-style grid: 1 image = full width; 2 = side by side;
-  /// 3+ = a row of 3 with a dark "+N" overlay on the last tile if
-  /// there are more than 3 images in the group. Tapping in
-  /// selection mode toggles the whole message instead of opening
-  /// the viewer (handled by the caller via [onImageTap] /
-  /// selectionMode already being checked upstream — here we only
-  /// need to decide which behaviour to invoke).
   Widget _buildImageGrid(BuildContext context) {
-    if (imagePaths.length == 1) {
-      return _imageTile(imagePaths[0], height: 180);
+    if (widget.imagePaths.length == 1) {
+      return _imageTile(widget.imagePaths[0], height: 180);
     }
 
-    final visibleCount = imagePaths.length >= 3 ? 3 : 2;
+    final visibleCount = widget.imagePaths.length >= 3 ? 3 : 2;
     final overlayCount =
-        imagePaths.length > 3 ? imagePaths.length - 3 : 0;
+        widget.imagePaths.length > 3 ? widget.imagePaths.length - 3 : 0;
 
     return Row(
       crossAxisAlignment: CrossAxisAlignment.start,
@@ -1782,7 +1750,7 @@ class _MessageBubble extends StatelessWidget {
           child: Padding(
             padding: EdgeInsets.only(left: i == 0 ? 0 : 4),
             child: _imageTile(
-              imagePaths[i],
+              widget.imagePaths[i],
               height: 140,
               overlayText: showOverlay ? '+$overlayCount' : null,
             ),
@@ -1798,7 +1766,7 @@ class _MessageBubble extends StatelessWidget {
     String? overlayText,
   }) {
     return GestureDetector(
-      onTap: () => onImageTap(path),
+      onTap: () => widget.onImageTap(path),
       child: ClipRRect(
         borderRadius: BorderRadius.circular(12),
         child: Stack(
@@ -1841,7 +1809,7 @@ class _MessageBubble extends StatelessWidget {
 }
 
 // ================================================================
-// Date/time helper — "18 Aug 2026, 3:45 PM"
+// Date/time helper
 // ================================================================
 
 const _kMonthNames = [

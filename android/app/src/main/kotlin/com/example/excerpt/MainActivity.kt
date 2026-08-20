@@ -389,18 +389,26 @@ class MainActivity : FlutterActivity() {
     // =====================================================
 
     private fun pickImportFile() {
-        val intent = Intent(Intent.ACTION_OPEN_DOCUMENT).apply {
-            addCategory(Intent.CATEGORY_OPENABLE)
-            type = "application/json"
-        }
-
-        try {
-            startActivityForResult(intent, PICK_IMPORT_FILE_REQUEST_CODE)
-        } catch (e: Exception) {
-            pendingImportResult?.error("IMPORT_PICKER_ERROR", e.message, null)
-            pendingImportResult = null
-        }
+    val intent = Intent(Intent.ACTION_OPEN_DOCUMENT).apply {
+        addCategory(Intent.CATEGORY_OPENABLE)
+        type = "*/*"
+        putExtra(
+            Intent.EXTRA_MIME_TYPES,
+            arrayOf(
+                "application/json",
+                "application/zip",
+                "application/x-zip-compressed"
+            )
+        )
     }
+
+    try {
+        startActivityForResult(intent, PICK_IMPORT_FILE_REQUEST_CODE)
+    } catch (e: Exception) {
+        pendingImportResult?.error("IMPORT_PICKER_ERROR", e.message, null)
+        pendingImportResult = null
+    }
+}
 
     override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
         super.onActivityResult(requestCode, resultCode, data)

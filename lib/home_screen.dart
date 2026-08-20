@@ -910,8 +910,6 @@ class _BrandMarkState extends State<_BrandMark> {
   bool _logoReady = false;
   bool _gifReady = false;
   bool _logoFailed = false;
-  bool _showGif = false;
-  Timer? _cycleTimer;
 
   @override
   void initState() {
@@ -920,6 +918,7 @@ class _BrandMarkState extends State<_BrandMark> {
   }
 
   Future<void> _preload() async {
+    // ১. প্রথমে মেইন লোগো লোড হবে
     try {
       await precacheImage(const NetworkImage(kMainLogoUrl), context);
       if (mounted) setState(() => _logoReady = true);
@@ -927,42 +926,32 @@ class _BrandMarkState extends State<_BrandMark> {
       if (mounted) setState(() => _logoFailed = true);
     }
 
+    // ২. ব্যাকগ্রাউন্ডে GIF ফেচ হবে
     try {
       await precacheImage(const NetworkImage(kBrandGifUrl), context);
-      if (mounted) setState(() => _gifReady = true);
-      _startCycle();
+      if (mounted) {
+        setState(() {
+          _gifReady = true; // ফেচ শেষ হওয়ামাত্র সবসময় GIF শো করবে
+        });
+      }
     } catch (_) {
-      // GIF unavailable — keep showing just the static logo.
+      // GIF লোড করতে ব্যর্থ হলে স্ট্যাটিক লোগোটাই থেকে যাবে
     }
-  }
-
-  void _startCycle() {
-    _cycleTimer?.cancel();
-    _cycleTimer = Timer.periodic(const Duration(seconds: 8), (_) {
-      if (!mounted || !_gifReady) return;
-      setState(() => _showGif = true);
-      Future.delayed(const Duration(seconds: 3), () {
-        if (mounted) setState(() => _showGif = false);
-      });
-    });
-  }
-
-  @override
-  void dispose() {
-    _cycleTimer?.cancel();
-    super.dispose();
   }
 
   @override
   Widget build(BuildContext context) {
     final size = widget.size;
 
-    if (_logoFailed) {
-      return Icon(Icons.content_paste_go_rounded,
-          size: size, color: Theme.of(context).colorScheme.primary);
+    if (_logoFailed && !_gifReady) {
+      return Icon(
+        Icons.content_paste_go_rounded,
+        size: size,
+        color: Theme.of(context).colorScheme.primary,
+      );
     }
 
-    if (!_logoReady) {
+    if (!_logoReady && !_gifReady) {
       return SizedBox(width: size, height: size);
     }
 
@@ -971,11 +960,11 @@ class _BrandMarkState extends State<_BrandMark> {
       child: AnimatedSwitcher(
         duration: const Duration(milliseconds: 500),
         child: SizedBox(
-          key: ValueKey(_showGif && _gifReady),
+          key: ValueKey(_gifReady),
           width: size,
           height: size,
           child: Image.network(
-            _showGif && _gifReady ? kBrandGifUrl : kMainLogoUrl,
+            _gifReady ? kBrandGifUrl : kMainLogoUrl,
             fit: BoxFit.contain,
             gaplessPlayback: true,
             errorBuilder: (_, __, ___) => Icon(
