@@ -1,166 +1,389 @@
-# Excerpt — Personal Research & Reference Archive
-### Final Technical Architecture (MVP — Android)
 
----
 
-## 1. Project Description
 
-**Excerpt** একটা personal research/reference archiving app যেটার মূল লক্ষ্য — user যখন কোথাও কোনো text, image, বা screenshot দেখে যেটা পরে reference হিসেবে দরকার হতে পারে, সেটা **current workflow ভেঙে না দিয়ে** save করা।
+<p align="center">
+  <img src="https://raw.githubusercontent.com/Irshad-11/Documents/refs/heads/main/ExcerptLogoHQ.png" alt="Excerpt Logo" width="180">
+</p>
+<h1 align="center">Excerpt</h1>
+<h3 align="center">Your <strong>Personal Research & Reference Archive.</strong></h3>
 
-সাধারণ note-taking app এ save করতে হলে user কে বর্তমান app ছেড়ে notes app এ যেতে হয়, paste/attach করতে হয়, organize করতে হয় — এই context-switch এর কারণে অনেক সময় information লস হয়ে যায় বা user save-ই করে না।
+<img src="https://img.icons8.com/?size=100&id=17836&format=png&color=000000" width="18" height="18" alt="Android"> **Android 10+** · Tested on **Android 16**
 
-Excerpt এই সমস্যাটা solve করে দুইভাবে:
 
-1. **Minimal-interaction capture** — clipboard copy বা image share থেকে সরাসরি, বর্তমান app এর উপরে ভেসে থাকা একটা lightweight overlay UI দিয়ে save করা যাবে, পুরোপুরি app switch ছাড়াই।
-2. **Chat-based organization** — saved reference গুলো traditional note-card হিসেবে না দেখিয়ে, familiar messaging-app এর মতো conversation (chat/folder) হিসেবে দেখানো হবে। System থেকে save হওয়া content "received message" হিসেবে, আর user এর নিজের manual note/attachment "sent message" হিসেবে bubble আকারে show হবে।
 
-MVP এ শুধু **text এবং image** capture নিয়ে কাজ হবে, ML classification ছাড়া (manual folder selection দিয়ে শুরু)। Future এ PDF capture, ML-based auto-classification, cloud sync, web app, এবং browser extension যোগ হবে।
+## About
 
----
+**Excerpt** is a personal research and reference archive for saving useful text, images, screenshots, translations, notes, and other references while browsing or using other apps.
 
-## 2. High-Level Architecture
+The goal is simple:
 
+> Save something useful without breaking your current workflow.
+
+Instead of switching between apps, copying content, opening a notes app, creating a note, and organizing it manually, Excerpt provides a quick capture flow directly over the app you're currently using.
+
+Saved references are organized into **Chats**, making the archive feel familiar and easy to navigate.
+
+
+
+## Problem Statement
+
+Research often happens while using completely different applications:
+
+- Facebook
+- WhatsApp
+- Browser
+- Telegram
+- PDF readers
+- Books and documents
+- Other social or productivity apps
+
+When something useful appears, the usual process is:
+
+```text
+See useful information
+        ↓
+Copy / Screenshot
+        ↓
+Leave current application
+        ↓
+Open Notes / Notion / Another app
+        ↓
+Create or find a note
+        ↓
+Paste / Attach
+        ↓
+Organize it
+````
+
+This creates unnecessary **context switching**.
+
+Because saving takes effort, useful information often gets lost in:
+
+* Clipboard history
+* Screenshots
+* Downloads
+* Random notes
+* Chat messages
+* Browser bookmarks
+
+Excerpt is designed to reduce that friction.
+
+
+
+# Proposed Solution
+
+Excerpt puts the saving workflow closer to where the information is actually found.
+
+## Text Capture
+
+```mermaid
+graph TD
+    A[Facebook / WhatsApp / Other Apps] --> B[Text Copied]
+    B --> C{Check Permission Grant}
+    C -->|"Yes"| D[Ask Chat in Overlay]
+    C -->|"No"| E[Prompt Permission]
+    E -->|"Grant Permission"| C
+    D --> F[Save]
 ```
-┌─────────────────────────────────────────────────────────────┐
-│                     ALWAYS-ON LAYER                          │
-│   Foreground Service (persistent notification)               │
-│   └── ClipboardManager.OnPrimaryClipChangedListener           │
-└───────────────────────┬───────────────────────────────────────┘
-                         │ clip changed event
-                         ▼
-┌─────────────────────────────────────────────────────────────┐
-│              FOCUS-BYPASS OVERLAY (invisible)                 │
-│   1x1 transparent TYPE_APPLICATION_OVERLAY window              │
-│   → app becomes "focused" momentarily                         │
-│   → ClipboardManager.getPrimaryClip() now returns real data   │
-│   → overlay immediately removed                                │
-└───────────────────────┬───────────────────────────────────────┘
-                         │ captured text
-                         ▼
-┌─────────────────────────────────────────────────────────────┐
-│                   SAVE NOTIFICATION                            │
-│   "New text copied" + [Save] [Dismiss] actions                 │
-└───────────┬─────────────────────────────────┬─────────────────┘
-    [Dismiss]│                                 │[Save]
-    discard  │                                 ▼
-             │              ┌─────────────────────────────────┐
-             │              │   FLOATING BOTTOM-SHEET OVERLAY   │
-             │              │   (SYSTEM_ALERT_WINDOW, floats     │
-             │              │    over current app, no task       │
-             │              │    switch)                          │
-             │              │  - folder/chat list (search)        │
-             │              │  - "+ new folder" quick add          │
-             │              │  - confirm → ✓ checkmark             │
-             │              └───────────────┬───────────────────┘
-             │                              ▼
-             │              ┌─────────────────────────────────┐
-             └─────────────▶│         LOCAL DATA LAYER          │
-                             │   Room DB (offline-first)          │
-                             │   - folders/chats table            │
-                             │   - messages/references table       │
-                             └───────────────┬───────────────────┘
-                                             ▼
-                             ┌─────────────────────────────────┐
-                             │           CHAT UI LAYER            │
-                             │  RecyclerView, left=received        │
-                             │  (system-saved), right=sent          │
-                             │  (user manual notes/attachments)     │
-                             └─────────────────────────────────┘
 
-┌─────────────────────────────────────────────────────────────┐
-│                  PARALLEL ENTRY: IMAGE CAPTURE                 │
-│   Android Share Sheet (ACTION_SEND / ACTION_SEND_MULTIPLE)     │
-│   user shares image → Excerpt appears in share menu             │
-│   → same Floating Bottom-Sheet Overlay for folder select        │
-│   → OCR (ML Kit Text Recognition) + Language ID runs             │
-│   → saved to same Local Data Layer                              │
-└─────────────────────────────────────────────────────────────┘
+Copy text from another application and Excerpt can provide a lightweight overlay where you can choose where the reference should be saved.
+
+No need to manually open Excerpt first.
+
+
+
+## Image Capture
+
+```mermaid
+graph TD
+    A[Facebook / WhatsApp / Other Apps] --> B[Image Share - Multiple Support]
+    B --> C[Open Share Sheet]
+    C --> D[Select Excerpt]
+    D --> E[Ask Chat in Overlay]
+    E --> F[Select Chat]
+    F --> G[Additional Message]
+    G --> H[Save]
 ```
 
----
+Images can be shared directly to Excerpt through the Android Share Sheet.
 
-## 3. Core Modules
+Multiple images can also be shared together.
 
-### 3.1 Clipboard Capture Module
-- **Trigger:** `ClipboardManager.OnPrimaryClipChangedListener`, registered from a running Foreground Service.
-- **Focus-bypass:** clip change detect হলে সাথে সাথে একটা 1x1px transparent `TYPE_APPLICATION_OVERLAY` window inflate করা হবে (requires `SYSTEM_ALERT_WINDOW` permission) → এই মুহূর্তে app "focused" গণ্য হয় → `getPrimaryClip()` কল করে real content read করা যাবে → overlay সাথে সাথে `removeView()` করে সরিয়ে ফেলা।
-- **Duplicate-guard:** একই clip content দুইবার notification না দেখানোর জন্য last-captured hash রাখতে হবে।
 
-### 3.2 Notification Module
-- Persistent low-priority notification (Foreground Service এর জন্য বাধ্যতামূলক) + প্রতিটা নতুন clip এর জন্য একটা আলাদা actionable notification (`Save` / `Dismiss`).
-- Notification নিজে শুধু trigger হিসেবে কাজ করবে — actual folder-selection UI notification এর ভিতরে না রেখে overlay bottom-sheet এ পাঠানো হবে (কারণ Android 12+ এ custom notification layout heavily restricted)।
 
-### 3.3 Floating Bottom-Sheet Overlay Module
-- `Save` চাপলে notification থেকে app খোলা হবে না — বরং একই `SYSTEM_ALERT_WINDOW` mechanism দিয়ে একটা bottom-sheet style floating view inflate হবে, current app এর উপরে ভেসে থাকবে।
-- Contains: existing folder/chat list (searchable), "+ new folder" inline input, confirm button।
-- Confirm করলে overlay বন্ধ হয়ে যাবে, data save হয়ে যাবে, ছোট্ট ✓ confirmation toast/animation দেখাবে।
-- এই একই component reuse হবে image-share flow-এও।
+# Features
 
-### 3.4 Image Capture Module
-- Manifest এ `ACTION_SEND` + `ACTION_SEND_MULTIPLE` intent-filter (mime type: `image/*`) — Android system share sheet এ Excerpt automatically list হবে।
-- Selected হলে Floating Bottom-Sheet Overlay module reuse করে folder select করানো হবে।
-- (Future: PDF এর জন্য একই intent-filter এ `application/pdf` যোগ করলেই হবে।)
+## Quick Capture
 
-### 3.5 OCR + Language Module
-- ML Kit **Text Recognition (on-device)** দিয়ে image থেকে text extract।
-- ML Kit **Language Identification (on-device)** দিয়ে extracted text এর language detect।
-- সম্পূর্ণ offline-capable, network দরকার নেই।
+* Capture copied text without manually opening the app.
+* Save images directly through the Android Share Sheet.
+* Supports multiple images in a single share action.
+* Lightweight overlay-based saving flow.
+* Designed to minimize context switching.
 
-### 3.6 Bengali Translation Module
-- ML Kit **Translate (on-device model)** ব্যবহার করে original content preserve রেখে পাশে Bengali translation দেখানো।
-- Bengali model availability/quality আলাদাভাবে verify করে নিতে হবে ML Kit এর supported-language list থেকে।
+## Chat-Based Organization
 
-### 3.7 Local Data Layer
-- **Room DB**, offline-first, দুইটা মূল entity:
-  - `Folder` (id, name, created_at, user-defined/auto)
-  - `Reference` (id, folder_id, type[text/image], content, ocr_text, detected_lang, translated_text, source_app(optional), timestamp)
-- MVP এ কোনো ML classification নেই — folder selection পুরোপুরি manual, structure টা এমনভাবে বানানো যাতে future এ একটা `suggested_folder_id` column সহজে যোগ করা যায়।
+Instead of traditional note cards, Excerpt organizes references into **Chats**.
 
-### 3.8 Chat UI Layer
-- `RecyclerView` + two message-bubble types:
-  - **Received (left):** system-captured references (clipboard/share থেকে auto-saved)
-  - **Sent (right):** user এর manual message/note/attachment, ভবিষ্যতে edit/reply/search করা যাবে
-- প্রতিটা folder একটা আলাদা "chat conversation" হিসেবে দেখানো হবে।
+Each chat acts as a research/reference space.
 
----
+You can keep different subjects, projects, topics, or research areas in separate chats.
 
-## 4. Required Permissions & User Setup
 
-| Permission / Setup | কেন দরকার |
-|---|---|
-| `SYSTEM_ALERT_WINDOW` (Display over other apps) | Clipboard focus-bypass overlay + floating bottom-sheet |
-| Foreground Service + persistent notification | Continuous clipboard listening |
-| Battery optimization exemption (ignore battery optimizations) | Aggressive OEM (MIUI/ColorOS/One UI) কে service kill করা থেকে আটকানো |
-| OEM Autostart whitelist (manual, OEM-specific) | Reboot এর পরেও service auto-start হওয়ার জন্য |
-| Notification permission (Android 13+) | Notification দেখানোর জন্য |
 
-> **Fallback:** কিছু OEM এ উপরের সব দেওয়ার পরেও service kill হতে পারে — এক্ষেত্রে user app এ periodically (যেমন প্রতি কিছু ঘন্টায়) ঢুকে service কে alive রাখতে পারবে, এটা primary flow না, শুধু safety-net।
+## Reference Archive
 
----
+Store different types of research material in one place:
 
-## 5. MVP Scope vs Future Roadmap
+* Text
+* Images
+* Screenshots
+* OCR extracted text
+* Translations
+* Notes
+* Source information
 
-**MVP (এখন যা বানানো হবে):**
-- Text capture (clipboard) + Image capture (share sheet)
-- Overlay-based save flow (notification → bottom sheet → save)
-- Manual folder/tag creation
-- Chat-style UI
-- On-device OCR + language detection
-- Bengali translation (preserving original)
-- Fully offline/local storage
 
-**Future (MVP এর পরে):**
-- ML-based auto category suggestion
-- PDF capture support
-- Cloud sync
-- Web application
-- Browser-based capture (extension)
 
----
+## OCR
 
-## 6. Key Feasibility Notes (রেফারেন্সের জন্য)
+Images can be processed using on-device OCR to extract readable text.
 
-- Android 10+ এ background/non-focused app clipboard read করতে পারে না — শুধু IME অথবা focused app পারে। তাই focus-bypass overlay trick বাধ্যতামূলক।
-- Android 12+ এ fully custom notification layout নেই বললেই চলে (system template force করে), তাই folder-selection UI notification এর বদলে overlay bottom-sheet এ implement করা হচ্ছে।
-- Android 15/16 এ `SYSTEM_ALERT_WINDOW` থাকা app background থেকে foreground service start করতে গেলে সেই মুহূর্তে visible overlay থাকা লাগে — আমাদের flow তে এমনিতেই overlay ব্যবহার হচ্ছে বলে এটা naturally align করে।
-- Share-sheet ভিত্তিক image capture এ কোনো OS-level restriction নেই, এটা standard ও পুরোপুরি reliable।
+This makes image-based references searchable and easier to work with later.
+
+
+
+## Language Detection
+
+Excerpt can detect the language of extracted text.
+
+This is useful when references come from different languages.
+
+
+
+## Bengali Translation
+
+Extracted text can be translated into Bengali while preserving the original content.
+
+The original reference remains available alongside the translation.
+
+
+
+## Import & Export
+
+Excerpt includes local **Import / Export** functionality so your archive is not locked inside the application.
+
+Useful for:
+
+* Backups
+* Moving data
+* Keeping personal archives
+* Restoring references
+* Future migration
+
+
+
+## Offline First
+
+Excerpt is designed to work locally.
+
+Your core references do not require a cloud account or external server to be stored.
+
+This keeps the archive:
+
+* Local
+* Private
+* Available offline
+
+
+
+## Manual Organization
+
+You stay in control of how references are organized.
+
+Create chats/folders for different purposes such as:
+
+```text
+Research
+├── Machine Learning
+├── Cyber Security
+├── History
+├── Books
+└── University
+
+Projects
+├── Excerpt
+├── PDF Insights
+└── Other Projects
+```
+
+
+
+# Technology
+
+| Technology  | Purpose                                                |
+| ----------- | ------------------------------------------------------ |
+| **Flutter** | Application UI and cross-platform development          |
+| **Kotlin**  | Android native features and system integration         |
+| **SQLite**  | Local data storage                                     |
+| **ML Kit**  | OCR, language identification and on-device translation |
+
+
+
+# Platform
+
+Currently focused on:
+
+**Android**
+
+The project uses Android-native capabilities for features that require interaction with the operating system, such as clipboard capture, overlays and sharing.
+
+
+
+# Project Status
+
+> **MVP — Active Development**
+
+The current version focuses on the core local research archive experience:
+
+* Text capture
+* Image sharing
+* Multiple image support
+* Overlay save flow
+* Chat-based organization
+* OCR
+* Language detection
+* Bengali translation
+* Import / Export
+* Offline local storage
+
+
+
+# Roadmap
+
+### Current
+
+* [x] Text capture
+* [x] Image sharing
+* [x] Multiple image support
+* [x] Overlay-based save flow
+* [x] Chat-based organization
+* [x] Local storage
+* [x] OCR
+* [x] Language detection
+* [x] Bengali translation
+* [x] Import / Export
+
+### Planned
+
+* [ ] Automatic reference classification
+* [ ] Smart folder suggestions
+* [ ] PDF capture
+* [ ] Browser extension
+* [ ] Web application
+* [ ] Cloud synchronization
+* [ ] Cross-device synchronization
+* [ ] Advanced search
+* [ ] Better source/reference metadata
+* [ ] More attachment types
+
+
+
+# Getting Started
+
+## Requirements
+
+Make sure you have:
+
+* Flutter SDK
+* Android Studio
+* Android SDK
+* Kotlin support
+* A physical Android device or Android emulator
+
+Check your Flutter environment:
+
+```bash
+flutter doctor
+```
+
+
+## Clone the Repository
+
+```bash
+git clone https://github.com/Irshad-11/Excerpt.git
+cd Excerpt
+```
+
+Install dependencies:
+
+```bash
+flutter pub get
+```
+
+Run the application:
+
+```bash
+flutter run
+```
+
+> **Note:** Some Excerpt features depend on Android system permissions and may work differently on an emulator. A physical Android device is recommended for testing clipboard, overlay and background-related functionality.
+
+
+# Permissions
+
+Some features require Android permissions.
+
+Depending on the Android version and device manufacturer, Excerpt may request permissions for:
+
+* Display over other apps
+* Notifications
+* Background operation
+* Clipboard-related functionality
+* Battery optimization
+* Other Android system integrations
+
+These permissions are required for specific capture features to work correctly.
+
+
+
+# Privacy
+
+Excerpt is designed around a **local-first** approach.
+
+The core archive is stored locally on the device using SQLite.
+
+The project does not require an account or cloud server for its core functionality.
+
+
+
+# Why "Excerpt"?
+
+An **excerpt** is a selected part of a larger piece of information.
+
+That's exactly what Excerpt is built for:
+
+> Keep the useful part. Keep the context. Build your archive.
+
+
+
+# Contributing
+
+Contributions, ideas, bug reports and feature requests are welcome.
+
+If you find a bug or have an idea for improving Excerpt, feel free to open an issue.
+
+For larger changes, opening an issue first is recommended so the proposed change can be discussed before implementation.
+
+
+
+# License
+
+License information will be added as the project is finalized.
+
+
+
+<p align="center">
+  <strong>Excerpt</strong><br>
+  Your Personal Research & Reference Archive.
+</p>
